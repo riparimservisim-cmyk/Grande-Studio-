@@ -432,7 +432,6 @@ def render_iphone_shell(title: str, inner_html: str) -> str:
           }} catch (e) {{}}
         }}
 
-        // Lidhja me Capacitor Push Notifications për APK-në tënde
         document.addEventListener('DOMContentLoaded', () => {{
           if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.PushNotifications) {{
             const {{ PushNotifications }} = window.Capacitor.Plugins;
@@ -455,7 +454,7 @@ def render_iphone_shell(title: str, inner_html: str) -> str:
               playNotificationChime();
             }});
           }}
-        }));
+        }});
       </script>
     </body>
     </html>
@@ -645,27 +644,27 @@ def index():
         const slotsEl = document.getElementById('slotsContainer');
         const startInput = document.getElementById('start_time');
 
-        async function loadSlots() {
+        async function loadSlots() {{
           if (!svcEl.value) return;
           const res = await fetch(`/api/slots?date=${{dateEl.value}}&service_id=${{svcEl.value}}`);
           const data = await res.json();
           slotsEl.innerHTML = '';
-          (data.slots || []).forEach(slot => {
+          (data.slots || []).forEach(slot => {{
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'btn-3d';
             btn.style.padding = '6px 10px';
             btn.style.fontSize = '0.85rem';
             btn.textContent = slot;
-            btn.onclick = () => {
+            btn.onclick = () => {{
               document.querySelectorAll('#slotsContainer button').forEach(b => b.style.background = '');
               btn.style.background = '#b81d3d';
               btn.style.color = '#fff';
               startInput.value = slot;
-            };
+            }};
             slotsEl.appendChild(btn);
-          });
-        }
+          }});
+        }}
         svcEl.addEventListener('change', loadSlots);
         dateEl.addEventListener('change', loadSlots);
         loadSlots();
