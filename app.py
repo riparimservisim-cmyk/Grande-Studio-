@@ -66,7 +66,9 @@ def get_vapid_keys() -> dict:
     if os.path.exists(VAPID_KEYS_PATH):
         try:
             with open(VAPID_KEYS_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                if data.get("private_key") and data.get("public_key"):
+                    return data
         except Exception:
             pass
 
@@ -507,7 +509,7 @@ def get_salon_settings() -> dict:
 
 
 def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> None:
-    """Dërgon Web Push Notifications me prioritet të lartë (urgency: high) për zë, vibrim dhe banner në Lock Screen."""
+    """Dërgon Web Push Notifications me prioritet të lartë (Urgency: high, aes128gcm) për zë, vibrim dhe banner kur app-i është i mbyllur."""
     if not HAS_WEBPUSH or not subs:
         return
     vapid = get_vapid_keys()
@@ -526,13 +528,18 @@ def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> None:
                 vapid_private_key=vapid["private_key"],
                 vapid_claims={"sub": "mailto:admin@grandestudio.local"},
                 ttl=86400,
-                headers={"Urgency": "high", "Topic": payload_dict.get("tag", "grande-studio")}
+                content_encoding="aes128gcm",
+                headers={
+                    "Urgency": "high",
+                    "Topic": payload_dict.get("tag", "grande-studio")[:32]
+                }
             )
         except WebPushException as ex:
+            print(f"[WEBPUSH] Gabim dërgimi: {ex}")
             if ex.response and ex.response.status_code in (404, 410):
                 dead_ids.append(sub["id"])
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WEBPUSH] Gabim i përgjithshëm: {e}")
 
     if dead_ids:
         conn = get_db()
@@ -561,7 +568,7 @@ def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int
         "body": body,
         "url": url,
         "appt_id": appt_id,
-        "tag": f"grande-studio-admin-{appt_id or 'alert'}",
+        "tag": f"gs-admin-{appt_id or 'alert'}",
         "actions": actions,
         "timestamp": datetime.now().isoformat()
     })
@@ -570,14 +577,19 @@ def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int
 def send_push_to_client(client_contact: str, title: str, body: str, url: str = "/", appt_id: int | None = None) -> None:
     conn = get_db()
     cur = conn.cursor()
-    if client_contact:
+    clean_c = (client_contact or "").strip().lower()
+    if clean_c:
         cur.execute(
-            "SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' AND (client_contact = ? OR client_contact = '')",
-            (client_contact.strip().lower(),),
+            "SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' AND LOWER(client_contact) = ?",
+            (clean_c,),
         )
+        subs = cur.fetchall()
+        if not subs:
+            cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' AND client_contact = ''")
+            subs = cur.fetchall()
     else:
         cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client'")
-    subs = cur.fetchall()
+        subs = cur.fetchall()
     conn.close()
 
     dispatch_web_push(subs, {
@@ -585,7 +597,7 @@ def send_push_to_client(client_contact: str, title: str, body: str, url: str = "
         "body": body,
         "url": url,
         "appt_id": appt_id,
-        "tag": f"grande-studio-client-{appt_id or 'alert'}",
+        "tag": f"gs-client-{appt_id or 'alert'}",
         "actions": [],
         "timestamp": datetime.now().isoformat()
     })
@@ -1512,14 +1524,6 @@ def render_iphone_shell(
         const PUSH_SUB_ROLE = '{push_role}';
         const PUSH_CLIENT_CONTACT = '{safe_client_contact}';
 
-        try {{
-          if (CURRENT_ROLE === 'admin') {{
-            localStorage.setItem('grande_studio_last_role', 'admin');
-          }} else if (CURRENT_ROLE === 'client_logged_in') {{
-            localStorage.setItem('grande_studio_last_role', 'client');
-          }}
-        }} catch (e) {{}}
-
         function unlockAudioContext() {{
           try {{
             const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -1564,12 +1568,14 @@ def render_iphone_shell(
           return outputArray;
         }}
 
-        async function autoEnableNotificationsAndPush(overrideContact) {{
+        async function autoEnableNotificationsAndPush(overrideContact, forcePrompt) {{
           try {{
-            if ('Notification' in window && Notification.permission === 'default') {{
-              await Notification.requestPermission().catch(() => {{}});
+            if (!('Notification' in window)) return false;
+            if (Notification.permission === 'default' || forcePrompt) {{
+              const perm = await Notification.requestPermission().catch(() => 'denied');
+              if (perm !== 'granted') return false;
             }}
-            if ('Notification' in window && Notification.permission === 'granted' && 'serviceWorker' in navigator && 'PushManager' in window) {{
+            if (Notification.permission === 'granted' && 'serviceWorker' in navigator && 'PushManager' in window) {{
               const reg = await navigator.serviceWorker.ready;
               const keyRes = await fetch('/api/push/public-key');
               const keyData = await keyRes.json();
@@ -1587,14 +1593,37 @@ def render_iphone_shell(
                   headers: {{ 'Content-Type': 'application/json' }},
                   body: JSON.stringify(subJson)
                 }}).catch(() => {{}});
+                return true;
               }}
             }}
           }} catch (e) {{}}
+          return false;
+        }}
+
+        async function testBackgroundLockScreenPush() {{
+          unlockAudioContext();
+          const ok = await autoEnableNotificationsAndPush('', true);
+          if (!ok) {{
+            alert('Ju lutem lejoni Njoftimet (Allow Notifications) në cilësimet e telefonit/shfletuesit dhe sigurohuni që aplikacioni është i instaluar në ekranin kryesor (Add to Home Screen).');
+            return;
+          }}
+          const res = await fetch('/api/push/test', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ role: PUSH_SUB_ROLE, client_contact: PUSH_CLIENT_CONTACT || localStorage.getItem('gs_client_contact') || '' }})
+          }});
+          const data = await res.json();
+          if (data.ok) {{
+            alert('Njoftimi testues u dërgua! Mbylleni aplikacionin dhe kyçni ekranin (Lock Screen) për ta parë.');
+          }} else {{
+            alert(data.error || 'Nuk u gjet abonim aktiv për këtë pajisje.');
+          }}
         }}
 
         if ('serviceWorker' in navigator) {{
           window.addEventListener('load', () => {{
-            navigator.serviceWorker.register('/sw.js', {{ scope: '/' }}).then(() => {{
+            navigator.serviceWorker.register('/sw.js', {{ scope: '/' }}).then(reg => {{
+              reg.update().catch(() => {{}});
               autoEnableNotificationsAndPush();
             }}).catch(() => {{}});
           }});
@@ -1625,7 +1654,6 @@ def render_iphone_shell(
           }}, 650);
         }}
 
-        // Aktivizon audion dhe lejen e njoftimeve në prekjen e parë pa rifreskuar faqen
         document.addEventListener('pointerdown', function() {{
           unlockAudioContext();
           autoEnableNotificationsAndPush();
@@ -1717,9 +1745,8 @@ def manifest():
 @app.route("/sw.js")
 def service_worker():
     js = """
-    const CACHE_NAME = 'grande-studio-v6';
+    const CACHE_NAME = 'grande-studio-v7';
     const CORE_ASSETS = [
-      '/',
       '/manifest.json',
       '/static/icon-192.png',
       '/static/icon-512.png'
@@ -1736,9 +1763,8 @@ def service_worker():
       event.waitUntil(
         caches.keys().then(keys =>
           Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
-        )
+        ).then(() => self.clients.claim())
       );
-      self.clients.claim();
     });
 
     self.addEventListener('fetch', event => {
@@ -1746,8 +1772,10 @@ def service_worker():
       const url = new URL(event.request.url);
       if (url.origin !== self.location.origin) return;
 
-      if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/admin')) {
-        event.respondWith(fetch(event.request));
+      if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/admin') || url.pathname === '/') {
+        event.respondWith(
+          fetch(event.request).catch(() => caches.match(event.request))
+        );
         return;
       }
 
@@ -1760,15 +1788,15 @@ def service_worker():
             }
             return resp;
           })
-          .catch(() => caches.match(event.request).then(cached => cached || caches.match('/')))
+          .catch(() => caches.match(event.request))
       );
     });
 
     self.addEventListener('push', event => {
       let data = {
-        title: '🔔 Rezervim i Ri — Grande Studio',
-        body: 'Një klient ka bërë një rezervim të ri!',
-        url: '/admin',
+        title: '🔔 Grande Studio',
+        body: 'Keni një njoftim të ri për termin!',
+        url: '/',
         appt_id: null,
         tag: 'grande-studio-booking',
         actions: []
@@ -1792,7 +1820,7 @@ def service_worker():
         requireInteraction: true,
         actions: Array.isArray(data.actions) ? data.actions : [],
         data: {
-          url: data.url || '/admin',
+          url: data.url || '/',
           appt_id: data.appt_id || null
         }
       };
@@ -1809,11 +1837,39 @@ def service_worker():
       );
     });
 
+    self.addEventListener('pushsubscriptionchange', event => {
+      event.waitUntil(
+        fetch('/api/push/public-key')
+          .then(res => res.json())
+          .then(keyData => {
+            if (!keyData.publicKey) return;
+            const padding = '='.repeat((4 - keyData.publicKey.length % 4) % 4);
+            const base64 = (keyData.publicKey + padding).replace(/-/g, '+').replace(/_/g, '/');
+            const rawData = atob(base64);
+            const appServerKey = new Uint8Array(rawData.length);
+            for (let i = 0; i < rawData.length; ++i) appServerKey[i] = rawData.charCodeAt(i);
+            return self.registration.pushManager.subscribe({
+              userVisibleOnly: true,
+              applicationServerKey: appServerKey
+            });
+          })
+          .then(newSub => {
+            if (!newSub) return;
+            return fetch('/api/push/subscribe', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(newSub)
+            });
+          })
+          .catch(() => {})
+      );
+    });
+
     self.addEventListener('notificationclick', event => {
       const action = event.action;
       const notifData = event.notification.data || {};
       const apptId = notifData.appt_id;
-      const targetUrl = notifData.url || '/admin';
+      const targetUrl = notifData.url || '/';
       event.notification.close();
 
       if ((action === 'confirm_appt' || action === 'cancel_appt') && apptId) {
@@ -1873,7 +1929,12 @@ def api_push_subscribe():
     if not data or not data.get("endpoint"):
         return jsonify({"ok": False, "error": "Abonim i pavlefshëm"}), 400
 
-    role = "admin" if (session.get("admin_logged_in") or data.get("role") == "admin") else "client"
+    req_role = data.get("role")
+    if req_role in ("admin", "client"):
+        role = req_role
+    else:
+        role = "admin" if session.get("admin_logged_in") else "client"
+
     client_contact = (session.get("client_contact") or data.get("client_contact") or "").strip().lower()
 
     conn = get_db()
@@ -1892,6 +1953,28 @@ def api_push_subscribe():
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "role": role})
+
+
+@app.route("/api/push/test", methods=["POST"])
+def api_push_test():
+    """Dërgon një njoftim testues Push me zë, vibrim dhe banner në Lock Screen."""
+    data = request.get_json(silent=True) or {}
+    role = data.get("role") or ("admin" if session.get("admin_logged_in") else "client")
+    if role == "admin":
+        send_push_to_admins(
+            title="🔔 Test Njoftimi — Grande Studio",
+            body="Njoftimet në sfond dhe Lock Screen po funksionojnë me zë, vibrim dhe banner!",
+            url="/admin",
+        )
+    else:
+        contact = (session.get("client_contact") or data.get("client_contact") or "").strip().lower()
+        send_push_to_client(
+            contact,
+            title="🔔 Test Njoftimi — Grande Studio",
+            body="Do të njoftoheni në Lock Screen sapo termini juaj të konfirmohet!",
+            url="/",
+        )
+    return jsonify({"ok": True})
 
 
 @app.route("/api/push/action", methods=["POST"])
@@ -2041,11 +2124,17 @@ def api_slots():
     return jsonify({"slots": slots, "duration_min": row["duration_min"]})
 
 
+@app.route("/client/logout")
+def client_logout():
+    for k in ("client_logged_in", "client_id", "client_contact", "client_contact_type", "client_name", "client_phone"):
+        session.pop(k, None)
+    return redirect(url_for("index"))
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     init_db()
-    if session.get("admin_logged_in"):
-        return redirect(url_for("admin_panel"))
+    is_admin_viewing = bool(session.get("admin_logged_in"))
 
     prepare_clean_nails_asset()
     prepare_ig_avatar_asset()
@@ -2108,7 +2197,7 @@ def index():
                         session["client_contact_type"] = existing_client["contact_type"]
                         session["client_name"] = existing_client["full_name"] or existing_client["contact_value"]
                         session["client_phone"] = existing_client["client_phone"] or ""
-                        msg = f"Mirësevini, {existing_client['contact_value']}! Jeni të kyçur në llogarinë tuaj."
+                        msg = f"Mirësevini, {existing_client['contact_value']}! Tani mund të caktoni terminin tuaj."
                         msg_type = "ok"
                     else:
                         msg = "Passwordi është i pasaktë. Nëse e keni harruar, kontaktoni adminin për 'Refresko Password'."
@@ -2132,7 +2221,7 @@ def index():
                     session["client_contact_type"] = c_type
                     session["client_name"] = display_name
                     session["client_phone"] = phone_in
-                    msg = f"Llogaria u regjistrua dhe u kyçët me {c_val}!"
+                    msg = f"Llogaria u regjistrua dhe u kyçët me {c_val}! Tani mund të caktoni terminin."
                     msg_type = "ok"
             active_tab = "book"
 
@@ -2178,75 +2267,81 @@ def index():
             active_tab = "book"
 
         else:
-            raw_contact_book = (request.form.get("client_contact") or session.get("client_contact") or "").strip()
-            _, norm_contact_book = normalize_contact_identifier(raw_contact_book)
-            client_name = (request.form.get("client_name") or session.get("client_name") or norm_contact_book).strip()
-            client_phone = (request.form.get("client_phone") or session.get("client_phone") or "").strip()
-            service_id = request.form.get("service_id", type=int)
-            appt_date = request.form.get("appt_date", "").strip()
-            start_time = request.form.get("start_time", "").strip()
-            notes = request.form.get("notes", "").strip()
-
-            cur.execute("SELECT * FROM services WHERE id = ?", (service_id,))
-            svc = cur.fetchone()
-
-            if not (norm_contact_book or client_name) or not client_phone or not svc or not appt_date or not start_time:
-                msg = "Ju lutem plotësoni të gjitha fushat e detyrueshme dhe zgjidhni një orar."
+            # Kontrollo që klienti të jetë i regjistruar/kyçur (ose admini në pamjen e klientit)
+            if not (session.get("client_logged_in") or is_admin_viewing):
+                msg = "Për të rezervuar termin, duhet fillimisht të regjistroheni ose të kyçeni në llogarinë tuaj!"
                 msg_type = "err"
                 active_tab = "book"
             else:
-                valid_slots = get_available_slots(appt_date, svc["duration_min"])
-                if start_time not in valid_slots:
-                    msg = "Ky orar nuk është më i lirë ose nuk mjafton për kohëzgjatjen e shërbimit."
+                raw_contact_book = (session.get("client_contact") or request.form.get("client_contact") or "").strip()
+                _, norm_contact_book = normalize_contact_identifier(raw_contact_book)
+                client_name = (request.form.get("client_name") or session.get("client_name") or norm_contact_book).strip()
+                client_phone = (request.form.get("client_phone") or session.get("client_phone") or "").strip()
+                service_id = request.form.get("service_id", type=int)
+                appt_date = request.form.get("appt_date", "").strip()
+                start_time = request.form.get("start_time", "").strip()
+                notes = request.form.get("notes", "").strip()
+
+                cur.execute("SELECT * FROM services WHERE id = ?", (service_id,))
+                svc = cur.fetchone()
+
+                if not (norm_contact_book or client_name) or not client_phone or not svc or not appt_date or not start_time:
+                    msg = "Ju lutem plotësoni të gjitha fushat e detyrueshme dhe zgjidhni një orar."
                     msg_type = "err"
                     active_tab = "book"
                 else:
-                    end_time = min_to_time(time_to_min(start_time) + svc["duration_min"])
-                    display_client_label = f"{client_name} ({norm_contact_book})" if norm_contact_book and norm_contact_book not in client_name else client_name
-                    cur.execute(
-                        """
-                        INSERT INTO appointments
-                        (client_name, client_phone, client_contact, service_id, appt_date, start_time, end_time, notes, status, is_new, client_notified, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Në Pritje', 1, 1, ?)
-                        """,
-                        (
-                            display_client_label,
-                            client_phone,
-                            norm_contact_book,
-                            service_id,
-                            appt_date,
-                            start_time,
-                            end_time,
-                            notes,
-                            datetime.now().isoformat(),
-                        ),
-                    )
-                    new_appt_id = cur.lastrowid
-                    if norm_contact_book:
-                        session["client_contact"] = norm_contact_book
-                    if session.get("client_id"):
+                    valid_slots = get_available_slots(appt_date, svc["duration_min"])
+                    if start_time not in valid_slots:
+                        msg = "Ky orar nuk është më i lirë ose nuk mjafton për kohëzgjatjen e shërbimit."
+                        msg_type = "err"
+                        active_tab = "book"
+                    else:
+                        end_time = min_to_time(time_to_min(start_time) + svc["duration_min"])
+                        display_client_label = f"{client_name} ({norm_contact_book})" if norm_contact_book and norm_contact_book not in client_name else client_name
                         cur.execute(
-                            "UPDATE clients SET full_name = ?, client_phone = ?, updated_at = ? WHERE id = ?",
-                            (client_name, client_phone, datetime.now().isoformat(), session["client_id"]),
+                            """
+                            INSERT INTO appointments
+                            (client_name, client_phone, client_contact, service_id, appt_date, start_time, end_time, notes, status, is_new, client_notified, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Në Pritje', 1, 1, ?)
+                            """,
+                            (
+                                display_client_label,
+                                client_phone,
+                                norm_contact_book,
+                                service_id,
+                                appt_date,
+                                start_time,
+                                end_time,
+                                notes,
+                                datetime.now().isoformat(),
+                            ),
                         )
-                    conn.commit()
+                        new_appt_id = cur.lastrowid
+                        if session.get("client_id"):
+                            cur.execute(
+                                "UPDATE clients SET full_name = ?, client_phone = ?, updated_at = ? WHERE id = ?",
+                                (client_name, client_phone, datetime.now().isoformat(), session["client_id"]),
+                            )
+                            session["client_phone"] = client_phone
+                        conn.commit()
 
-                    send_push_to_admins(
-                        title=f"🔔 Kërkesë për Termin: {display_client_label}",
-                        body=f"{svc['name']} • Data: {appt_date} në {start_time} • Tel: {client_phone}",
-                        url="/admin",
-                        appt_id=new_appt_id,
-                    )
+                        send_push_to_admins(
+                            title=f"🔔 Kërkesë për Termin: {display_client_label}",
+                            body=f"{svc['name']} • Data: {appt_date} në {start_time} • Tel: {client_phone}",
+                            url="/admin",
+                            appt_id=new_appt_id,
+                        )
 
-                    msg = f"Kërkesa për termin u dërgua për {display_client_label} më {appt_date} në ora {start_time} ({svc['name']}). Do të njoftoheni sapo admini ta konfirmojë!"
-                    msg_type = "ok"
-                    active_tab = "book"
+                        msg = f"Kërkesa për termin u dërgua për {display_client_label} më {appt_date} në ora {start_time} ({svc['name']}). Do të njoftoheni sapo admini ta konfirmojë!"
+                        msg_type = "ok"
+                        active_tab = "book"
 
     saved_client_contact = session.get("client_contact", "")
     saved_client_name = session.get("client_name", "")
     saved_client_phone = session.get("client_phone", "")
     is_client_logged_in = bool(session.get("client_logged_in") and saved_client_contact)
-    role_tag = "client_logged_in" if is_client_logged_in else "client"
+    can_book_now = is_client_logged_in or is_admin_viewing
+    role_tag = "admin" if is_admin_viewing else ("client_logged_in" if is_client_logged_in else "client")
 
     client_appts = []
     if saved_client_contact:
@@ -2330,51 +2425,135 @@ def index():
         </div>
         """
 
-    client_login_card = ""
+    admin_viewing_banner = ""
+    if is_admin_viewing:
+        admin_viewing_banner = f"""
+        <div class="card-3d" style="padding:10px 12px; background:#fff0f4; border:1.5px solid var(--vishnje-bright);">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+            <span style="font-size:0.76rem; font-weight:800; color:var(--vishnje-dark);">
+              🛡️ Jeni të kyçur si Admin (Pamja e Klientit)
+            </span>
+            <a href="{url_for('admin_panel')}" class="btn-3d btn-vishnje-3d" style="padding:6px 10px; font-size:0.72rem; white-space:nowrap;">
+              Kthehu në Admin →
+            </a>
+          </div>
+        </div>
+        """
+
     if is_client_logged_in:
         client_login_card = f"""
         <div class="card-3d" style="padding:10px 12px; background:#fff9fb;">
-          <div style="font-size:0.78rem; color:var(--vishnje-dark);">
-            <b>👤 Klienti i kyçur:</b> {saved_client_contact}
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+            <div style="font-size:0.78rem; color:var(--vishnje-dark);">
+              <b>👤 Klienti i kyçur:</b> {saved_client_contact}
+            </div>
+            <div style="display:flex; gap:5px;">
+              <button type="button" onclick="testBackgroundLockScreenPush()" class="btn-sm-3d btn-seen" style="font-size:0.68rem;">🔔 Testo Njoftimin</button>
+              <a href="{url_for('client_logout')}" class="btn-sm-3d btn-del" style="text-decoration:none; font-size:0.68rem;">Dil</a>
+            </div>
           </div>
-          <div style="font-size:0.7rem; color:var(--muted); margin-top:2px;">
-            Njoftimet me zë, vibrim dhe banner janë aktive për statusin e terminit tuaj.
+          <div style="font-size:0.7rem; color:var(--muted); margin-top:4px;">
+            Njoftimet në Lock Screen me zë, vibrim dhe banner janë aktive për statusin e terminit tuaj.
           </div>
         </div>
         """
     else:
         client_login_card = f"""
-        <div class="card-3d" style="padding:12px;">
-          <h2>👤 Kyçja / Regjistrimi i Klientit</h2>
-          <p style="margin:0 0 8px; font-size:0.76rem; color:var(--muted);">
-            Kyçuni me <b>Email</b> ose <b>Instagram</b> dhe <b>Password</b>. Pas kyçjes, merrni njoftime automatike kur termini konfirmohet.
+        <div class="card-3d" style="padding:13px; border: 1.5px solid var(--vishnje-bright);">
+          <h2>🔐 Kyçu ose Regjistrohu për të Caktuar Termin</h2>
+          <p style="margin:0 0 8px; font-size:0.77rem; color:var(--muted); line-height:1.4;">
+            Për të rezervuar termin te <b>Grande Studio</b>, fillimisht regjistrohuni ose kyçuni me <b>Email</b> ose <b>Instagram</b> dhe <b>Password</b>.
           </p>
           <form method="POST">
             <input type="hidden" name="post_mode" value="client_auth">
             <input type="hidden" name="active_tab" value="book">
 
-            <label for="auth_contact">Email ose Instagram</label>
+            <label for="auth_contact">Email ose Instagram *</label>
             <input type="text" name="auth_contact" id="auth_contact" placeholder="p.sh. sara@email.com ose @sara.beauty" required>
 
-            <label for="auth_password">Password</label>
-            <input type="password" name="auth_password" id="auth_password" placeholder="Shkruani passwordin..." required>
+            <label for="auth_password">Password *</label>
+            <input type="password" name="auth_password" id="auth_password" placeholder="Të paktën 4 karaktere..." required>
 
             <div class="row-2">
               <div>
-                <label for="auth_full_name">Emri (opsionale)</label>
+                <label for="auth_full_name">Emri &amp; Mbiemri</label>
                 <input type="text" name="auth_full_name" id="auth_full_name" placeholder="p.sh. Sara Berisha">
               </div>
               <div>
-                <label for="auth_phone">Telefoni (opsionale)</label>
+                <label for="auth_phone">Numri i Telefonit</label>
                 <input type="tel" name="auth_phone" id="auth_phone" placeholder="+383 44 ...">
               </div>
             </div>
 
-            <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:11px; padding:9px 12px; font-size:0.84rem;">
-              Kyçu / Regjistrohu
+            <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px; padding:10px 12px; font-size:0.86rem;">
+              ✨ Kyçu / Regjistrohu Tani
             </button>
           </form>
         </div>
+        """
+
+    booking_form_card_html = ""
+    if can_book_now:
+        contact_readonly_attr = "readonly" if is_client_logged_in else ""
+        booking_form_card_html = f"""
+          <div class="card-3d">
+            <h2>Rezervo Terminin Tënd</h2>
+
+            <label>Filtro sipas Zonës</label>
+            <div class="cat-filter-row" id="categoryFilterRow">
+              <button type="button" class="cat-chip-3d active" data-cat="ALL" onclick="filterServicesByCat('ALL')">Të gjitha</button>
+              <button type="button" class="cat-chip-3d" data-cat="Kombinim" onclick="filterServicesByCat('Kombinim')">Kombinim</button>
+              <button type="button" class="cat-chip-3d" data-cat="Thonj" onclick="filterServicesByCat('Thonj')">Thonj</button>
+              <button type="button" class="cat-chip-3d" data-cat="Qerpikë" onclick="filterServicesByCat('Qerpikë')">Qerpikë</button>
+              <button type="button" class="cat-chip-3d" data-cat="Vetulla" onclick="filterServicesByCat('Vetulla')">Vetulla</button>
+            </div>
+
+            <form method="POST" id="bookingForm">
+              <input type="hidden" name="post_mode" value="booking">
+              <input type="hidden" name="active_tab" value="book">
+
+              <label for="service_id">1. Zgjidh Shërbimin / Paketën</label>
+              <select name="service_id" id="service_id" required>
+                {service_options}
+              </select>
+
+              <label for="appt_date">2. Zgjidh Datën</label>
+              <input type="date" name="appt_date" id="appt_date" value="{today_str}" min="{today_str}" required>
+
+              <label>3. Zgjidh Orarin e Lirë</label>
+              <div id="slotsContainer" class="slots">Duke ngarkuar oraret...</div>
+              <input type="hidden" name="start_time" id="start_time" required>
+
+              <div class="row-2">
+                <div>
+                  <label for="client_contact">Llogaria (Email / IG)</label>
+                  <input type="text" name="client_contact" id="client_contact" value="{saved_client_contact}" {contact_readonly_attr} placeholder="p.sh. sara@email.com ose @sara.beauty" required>
+                </div>
+                <div>
+                  <label for="client_phone">Numri i Telefonit *</label>
+                  <input type="tel" name="client_phone" id="client_phone" value="{saved_client_phone}" placeholder="p.sh. +383 44 ..." required>
+                </div>
+              </div>
+
+              <label for="notes">Detaje për Thonj, Qerpikë ose Vetulla</label>
+              <textarea name="notes" id="notes" rows="2" placeholder="p.sh. thonj mandorle vishnje, lash lift, laminim vetullash..."></textarea>
+
+              <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:14px;">
+                ✨ Dërgo Kërkesën për Termin
+              </button>
+            </form>
+          </div>
+        """
+
+    if is_admin_viewing:
+        header_right_buttons = f"""
+            <a href="{url_for('admin_panel')}" class="btn-3d btn-ghost-3d">🛡️ Paneli Admin</a>
+            <a href="{url_for('admin_logout')}" class="btn-3d btn-ghost-3d">Dil</a>
+        """
+    else:
+        header_right_buttons = f"""
+            <a href="{url_for('admin_login')}" class="btn-3d btn-ghost-3d">🔒 Admin</a>
+            <a href="{url_for('admin_reset_password')}" class="btn-3d btn-ghost-3d">🔑 Reset password</a>
         """
 
     w_start = settings.get("work_start") or WORK_START
@@ -2415,14 +2594,14 @@ def index():
             {ig_nav_html}
           </div>
           <div class="header-actions">
-            <a href="{url_for('admin_login')}" class="btn-3d btn-ghost-3d">🔒 Admin</a>
-            <a href="{url_for('admin_reset_password')}" class="btn-3d btn-ghost-3d">🔑 Reset password</a>
+            {header_right_buttons}
           </div>
         </div>
       </header>
 
       <div class="container">
         {alert_html}
+        {admin_viewing_banner}
 
         <div class="install-prompt-box" id="pwaInstallBanner" style="display:flex;">
           <div style="font-size:0.76rem; color:var(--vishnje-dark); line-height:1.3;">
@@ -2463,54 +2642,7 @@ def index():
         <div id="tab-book" class="tab-panel {'active' if active_tab == 'book' else ''}">
           {client_login_card}
           {client_appts_html}
-
-          <div class="card-3d">
-            <h2>Rezervo Terminin Tënd</h2>
-
-            <label>Filtro sipas Zonës</label>
-            <div class="cat-filter-row" id="categoryFilterRow">
-              <button type="button" class="cat-chip-3d active" data-cat="ALL" onclick="filterServicesByCat('ALL')">Të gjitha</button>
-              <button type="button" class="cat-chip-3d" data-cat="Kombinim" onclick="filterServicesByCat('Kombinim')">Kombinim</button>
-              <button type="button" class="cat-chip-3d" data-cat="Thonj" onclick="filterServicesByCat('Thonj')">Thonj</button>
-              <button type="button" class="cat-chip-3d" data-cat="Qerpikë" onclick="filterServicesByCat('Qerpikë')">Qerpikë</button>
-              <button type="button" class="cat-chip-3d" data-cat="Vetulla" onclick="filterServicesByCat('Vetulla')">Vetulla</button>
-            </div>
-
-            <form method="POST" id="bookingForm">
-              <input type="hidden" name="post_mode" value="booking">
-              <input type="hidden" name="active_tab" value="book">
-
-              <label for="service_id">1. Zgjidh Shërbimin / Paketën</label>
-              <select name="service_id" id="service_id" required>
-                {service_options}
-              </select>
-
-              <label for="appt_date">2. Zgjidh Datën</label>
-              <input type="date" name="appt_date" id="appt_date" value="{today_str}" min="{today_str}" required>
-
-              <label>3. Zgjidh Orarin e Lirë</label>
-              <div id="slotsContainer" class="slots">Duke ngarkuar oraret...</div>
-              <input type="hidden" name="start_time" id="start_time" required>
-
-              <div class="row-2">
-                <div>
-                  <label for="client_contact">Email ose Instagram</label>
-                  <input type="text" name="client_contact" id="client_contact" value="{saved_client_contact}" placeholder="p.sh. sara@email.com ose @sara.beauty" required>
-                </div>
-                <div>
-                  <label for="client_phone">Numri i Telefonit</label>
-                  <input type="tel" name="client_phone" id="client_phone" value="{saved_client_phone}" placeholder="p.sh. +383 44 ..." required>
-                </div>
-              </div>
-
-              <label for="notes">Detaje për Thonj, Qerpikë ose Vetulla</label>
-              <textarea name="notes" id="notes" rows="2" placeholder="p.sh. thonj mandorle vishnje, lash lift, laminim vetullash..."></textarea>
-
-              <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:14px;">
-                ✨ Dërgo Kërkesën për Termin
-              </button>
-            </form>
-          </div>
+          {booking_form_card_html}
         </div>
 
         <div id="tab-install" class="tab-panel {'active' if active_tab == 'install' else ''}">
@@ -2627,7 +2759,6 @@ def index():
           }});
         }}
 
-        // Rikthen tabin e zgjedhur nga klienti pa ndërhyrë në klikime
         try {{
           const urlParams = new URLSearchParams(window.location.search);
           const forcedTab = urlParams.get('tab');
@@ -2644,86 +2775,83 @@ def index():
         const slotsEl = document.getElementById('slotsContainer');
         const startInput = document.getElementById('start_time');
         const clientContactInput = document.getElementById('client_contact');
+        const bookingFormEl = document.getElementById('bookingForm');
 
-        if (clientContactInput) {{
-          if (clientContactInput.value) {{
-            try {{ localStorage.setItem('gs_client_contact', clientContactInput.value.trim().toLowerCase()); }} catch (e) {{}}
-          }}
-          clientContactInput.addEventListener('blur', () => {{
-            const val = clientContactInput.value.trim().toLowerCase();
-            if (val) {{
-              try {{ localStorage.setItem('gs_client_contact', val); }} catch (e) {{}}
-              autoEnableNotificationsAndPush(val);
-            }}
-          }});
+        if (clientContactInput && clientContactInput.value) {{
+          try {{ localStorage.setItem('gs_client_contact', clientContactInput.value.trim().toLowerCase()); }} catch (e) {{}}
         }}
 
-        const allOptions = Array.from(svcEl.options).map(opt => ({{
-          value: opt.value,
-          cat: opt.getAttribute('data-cat'),
-          text: opt.text
-        }}));
+        if (svcEl && dateEl && slotsEl && startInput) {{
+          const allOptions = Array.from(svcEl.options).map(opt => ({{
+            value: opt.value,
+            cat: opt.getAttribute('data-cat'),
+            text: opt.text
+          }}));
 
-        function filterServicesByCat(cat) {{
-          document.querySelectorAll('#categoryFilterRow .cat-chip-3d').forEach(b => {{
-            b.classList.toggle('active', b.getAttribute('data-cat') === cat);
-          }});
-          const filtered = cat === 'ALL' ? allOptions : allOptions.filter(o => o.cat === cat);
-          svcEl.innerHTML = '';
-          filtered.forEach(o => {{
-            const opt = document.createElement('option');
-            opt.value = o.value;
-            opt.setAttribute('data-cat', o.cat);
-            opt.textContent = o.text;
-            svcEl.appendChild(opt);
-          }});
+          window.filterServicesByCat = function(cat) {{
+            document.querySelectorAll('#categoryFilterRow .cat-chip-3d').forEach(b => {{
+              b.classList.toggle('active', b.getAttribute('data-cat') === cat);
+            }});
+            const filtered = cat === 'ALL' ? allOptions : allOptions.filter(o => o.cat === cat);
+            svcEl.innerHTML = '';
+            filtered.forEach(o => {{
+              const opt = document.createElement('option');
+              opt.value = o.value;
+              opt.setAttribute('data-cat', o.cat);
+              opt.textContent = o.text;
+              svcEl.appendChild(opt);
+            }});
+            loadSlots();
+          }};
+
+          async function loadSlots() {{
+            startInput.value = '';
+            if (!svcEl.value) {{
+              slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Nuk ka shërbim të zgjedhur.</span>';
+              return;
+            }}
+            slotsEl.innerHTML = '<span style="color:#6e4e57;font-size:0.82rem;">Po kontrollohen oraret e lira...</span>';
+            const res = await fetch(`/api/slots?date=${{encodeURIComponent(dateEl.value)}}&service_id=${{encodeURIComponent(svcEl.value)}}`);
+            const data = await res.json();
+            slotsEl.innerHTML = '';
+
+            if (!data.slots || data.slots.length === 0) {{
+              slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Nuk ka orare të lira për këtë datë dhe kohëzgjatje.</span>';
+              return;
+            }}
+
+            data.slots.forEach(slot => {{
+              const btn = document.createElement('button');
+              btn.type = 'button';
+              btn.className = 'slot-3d';
+              btn.textContent = slot;
+              btn.onclick = () => {{
+                document.querySelectorAll('.slot-3d').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                startInput.value = slot;
+              }};
+              slotsEl.appendChild(btn);
+            }});
+          }}
+
+          svcEl.addEventListener('change', loadSlots);
+          dateEl.addEventListener('change', loadSlots);
+          if (bookingFormEl) {{
+            bookingFormEl.addEventListener('submit', (e) => {{
+              if (!startInput.value) {{
+                e.preventDefault();
+                alert('Ju lutem zgjidhni një orar të lirë!');
+                return;
+              }}
+              if (clientContactInput && clientContactInput.value) {{
+                try {{ localStorage.setItem('gs_client_contact', clientContactInput.value.trim().toLowerCase()); }} catch (err) {{}}
+              }}
+            }});
+          }}
+
           loadSlots();
         }}
 
-        async function loadSlots() {{
-          startInput.value = '';
-          if (!svcEl.value) {{
-            slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Nuk ka shërbim të zgjedhur.</span>';
-            return;
-          }}
-          slotsEl.innerHTML = '<span style="color:#6e4e57;font-size:0.82rem;">Po kontrollohen oraret e lira...</span>';
-          const res = await fetch(`/api/slots?date=${{encodeURIComponent(dateEl.value)}}&service_id=${{encodeURIComponent(svcEl.value)}}`);
-          const data = await res.json();
-          slotsEl.innerHTML = '';
-
-          if (!data.slots || data.slots.length === 0) {{
-            slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Nuk ka orare të lira për këtë datë dhe kohëzgjatje.</span>';
-            return;
-          }}
-
-          data.slots.forEach(slot => {{
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = 'slot-3d';
-            btn.textContent = slot;
-            btn.onclick = () => {{
-              document.querySelectorAll('.slot-3d').forEach(b => b.classList.remove('active'));
-              btn.classList.add('active');
-              startInput.value = slot;
-            }};
-            slotsEl.appendChild(btn);
-          }});
-        }}
-
-        svcEl.addEventListener('change', loadSlots);
-        dateEl.addEventListener('change', loadSlots);
-        document.getElementById('bookingForm').addEventListener('submit', (e) => {{
-          if (!startInput.value) {{
-            e.preventDefault();
-            alert('Ju lutem zgjidhni një orar të lirë!');
-            return;
-          }}
-          if (clientContactInput && clientContactInput.value) {{
-            try {{ localStorage.setItem('gs_client_contact', clientContactInput.value.trim().toLowerCase()); }} catch (err) {{}}
-          }}
-        }});
-
-        // Kontrollon çdo 5 sekonda nëse admini e ka konfirmuar ose anuluar terminin e klientit
         setInterval(async () => {{
           try {{
             const c = (PUSH_CLIENT_CONTACT || localStorage.getItem('gs_client_contact') || '').trim();
@@ -2750,8 +2878,6 @@ def index():
             }}
           }} catch (e) {{}}
         }}, 5000);
-
-        loadSlots();
       </script>
     """
     return render_iphone_shell(
@@ -3448,9 +3574,14 @@ def admin_panel():
             <div style="font-size:0.76rem; font-weight:700; color:var(--vishnje);">
               🔔 Njoftimet &amp; zëri aktivë • <span id="autoSaveIndicator">Ruajtje automatike</span>
             </div>
-            <button type="button" onclick="openRegisteredClientsModal()" class="btn-3d btn-vishnje-3d" style="padding:7px 11px; font-size:0.76rem;">
-              👥 Klientët e Regjistruar ({len(registered_clients)})
-            </button>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+              <button type="button" onclick="testBackgroundLockScreenPush()" class="btn-sm-3d btn-seen" style="margin:0;">
+                🔔 Testo Lock Screen
+              </button>
+              <button type="button" onclick="openRegisteredClientsModal()" class="btn-3d btn-vishnje-3d" style="padding:7px 11px; font-size:0.76rem;">
+                👥 Klientët ({len(registered_clients)})
+              </button>
+            </div>
           </div>
         </div>
 
