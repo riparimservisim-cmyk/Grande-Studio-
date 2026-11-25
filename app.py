@@ -1,3 +1,4 @@
+import html
 import json
 import os
 import random
@@ -59,6 +60,10 @@ MAX_FAILED_ATTEMPTS = 5
 LOCK_WINDOW_SECONDS = 300
 
 
+def esc(val) -> str:
+    return html.escape(str(val or ""), quote=True)
+
+
 def resolve_db_path() -> str:
     env_dir = (os.environ.get("DATA_DIR") or "").strip()
     candidate_dirs = [d for d in [env_dir, BASE_DIR, tempfile.gettempdir()] if d]
@@ -114,7 +119,7 @@ def get_vapid_keys() -> dict:
             priv_pem = vapid.private_pem().decode("utf-8")
             pub_raw = vapid.public_key.public_bytes(
                 serialization.Encoding.X962,
-                serialization.PublicFormat.UncompressedPoint
+                serialization.PublicFormat.UncompressedPoint,
             )
             pub_b64 = base64.urlsafe_b64encode(pub_raw).rstrip(b"=").decode("utf-8")
             keys = {"private_key": priv_pem, "public_key": pub_b64}
@@ -329,8 +334,10 @@ def prepare_app_icons() -> None:
     def make_solid_png(w: int, h: int, rgba: tuple[int, int, int, int]) -> bytes:
         raw_row = b"\x00" + bytes(rgba) * w
         raw_data = raw_row * h
+
         def chunk(tag: bytes, data: bytes) -> bytes:
             return struct.pack("!I", len(data)) + tag + data + struct.pack("!I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
         ihdr = struct.pack("!IIBBBBB", w, h, 8, 6, 0, 0, 0)
         return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw_data)) + chunk(b"IEND", b"")
 
@@ -357,156 +364,158 @@ def get_db():
 
 def init_db():
     conn = get_db()
-    cur = conn.cursor()
+    try:
+        cur = conn.cursor()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS admin_account (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            email TEXT NOT NULL,
-            password_hash TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS admin_account (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                email TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS salon_settings (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            work_start TEXT NOT NULL DEFAULT '09:00',
-            work_end TEXT NOT NULL DEFAULT '18:30',
-            slot_step_min INTEGER NOT NULL DEFAULT 30,
-            hygiene_note TEXT NOT NULL DEFAULT 'Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.',
-            updated_at TEXT NOT NULL
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS salon_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                work_start TEXT NOT NULL DEFAULT '09:00',
+                work_end TEXT NOT NULL DEFAULT '18:30',
+                slot_step_min INTEGER NOT NULL DEFAULT 30,
+                hygiene_note TEXT NOT NULL DEFAULT 'Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.',
+                updated_at TEXT NOT NULL
+            )
+        """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS clients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            full_name TEXT NOT NULL DEFAULT '',
-            contact_type TEXT NOT NULL DEFAULT 'instagram',
-            contact_value TEXT UNIQUE NOT NULL,
-            client_phone TEXT NOT NULL DEFAULT '',
-            password_hash TEXT NOT NULL DEFAULT '',
-            is_blocked INTEGER NOT NULL DEFAULT 0,
-            reset_pending INTEGER NOT NULL DEFAULT 0,
-            reset_token TEXT NOT NULL DEFAULT '',
-            reset_sent_via TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL DEFAULT '',
-            updated_at TEXT NOT NULL DEFAULT ''
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS clients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                full_name TEXT NOT NULL DEFAULT '',
+                contact_type TEXT NOT NULL DEFAULT 'instagram',
+                contact_value TEXT UNIQUE NOT NULL,
+                client_phone TEXT NOT NULL DEFAULT '',
+                password_hash TEXT NOT NULL DEFAULT '',
+                is_blocked INTEGER NOT NULL DEFAULT 0,
+                reset_pending INTEGER NOT NULL DEFAULT 0,
+                reset_token TEXT NOT NULL DEFAULT '',
+                reset_sent_via TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+        """)
 
-    cur.execute("PRAGMA table_info(clients)")
-    client_cols = [row["name"] for row in cur.fetchall()]
-    if "full_name" not in client_cols:
-        cur.execute("ALTER TABLE clients ADD COLUMN full_name TEXT NOT NULL DEFAULT ''")
-    if "client_phone" not in client_cols:
-        cur.execute("ALTER TABLE clients ADD COLUMN client_phone TEXT NOT NULL DEFAULT ''")
-    if "is_blocked" not in client_cols:
-        cur.execute("ALTER TABLE clients ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0")
-    if "reset_pending" not in client_cols:
-        cur.execute("ALTER TABLE clients ADD COLUMN reset_pending INTEGER NOT NULL DEFAULT 0")
-    if "reset_token" not in client_cols:
-        cur.execute("ALTER TABLE clients ADD COLUMN reset_token TEXT NOT NULL DEFAULT ''")
-    if "reset_sent_via" not in client_cols:
-        cur.execute("ALTER TABLE clients ADD COLUMN reset_sent_via TEXT NOT NULL DEFAULT ''")
-    if "updated_at" not in client_cols:
-        cur.execute("ALTER TABLE clients ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+        cur.execute("PRAGMA table_info(clients)")
+        client_cols = [row["name"] for row in cur.fetchall()]
+        for col_name, col_sql in [
+            ("full_name", "ALTER TABLE clients ADD COLUMN full_name TEXT NOT NULL DEFAULT ''"),
+            ("client_phone", "ALTER TABLE clients ADD COLUMN client_phone TEXT NOT NULL DEFAULT ''"),
+            ("is_blocked", "ALTER TABLE clients ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0"),
+            ("reset_pending", "ALTER TABLE clients ADD COLUMN reset_pending INTEGER NOT NULL DEFAULT 0"),
+            ("reset_token", "ALTER TABLE clients ADD COLUMN reset_token TEXT NOT NULL DEFAULT ''"),
+            ("reset_sent_via", "ALTER TABLE clients ADD COLUMN reset_sent_via TEXT NOT NULL DEFAULT ''"),
+            ("updated_at", "ALTER TABLE clients ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"),
+        ]:
+            if col_name not in client_cols:
+                cur.execute(col_sql)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS services (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,
-            name TEXT NOT NULL,
-            duration_min INTEGER NOT NULL,
-            price REAL NOT NULL,
-            description TEXT DEFAULT ''
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS services (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                name TEXT NOT NULL,
+                duration_min INTEGER NOT NULL,
+                price REAL NOT NULL,
+                description TEXT DEFAULT ''
+            )
+        """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS appointments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_name TEXT NOT NULL,
-            client_phone TEXT NOT NULL,
-            client_contact TEXT DEFAULT '',
-            service_id INTEGER,
-            appt_date TEXT NOT NULL,
-            start_time TEXT NOT NULL,
-            end_time TEXT NOT NULL,
-            notes TEXT DEFAULT '',
-            status TEXT DEFAULT 'Konfirmuar',
-            is_new INTEGER DEFAULT 1,
-            client_notified INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (service_id) REFERENCES services (id) ON DELETE SET NULL
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS appointments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_name TEXT NOT NULL,
+                client_phone TEXT NOT NULL,
+                client_contact TEXT DEFAULT '',
+                service_id INTEGER,
+                appt_date TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                notes TEXT DEFAULT '',
+                status TEXT DEFAULT 'Konfirmuar',
+                is_new INTEGER DEFAULT 1,
+                client_notified INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (service_id) REFERENCES services (id) ON DELETE SET NULL
+            )
+        """)
 
-    cur.execute("PRAGMA table_info(appointments)")
-    appt_cols = [row["name"] for row in cur.fetchall()]
-    if "is_new" not in appt_cols:
-        cur.execute("ALTER TABLE appointments ADD COLUMN is_new INTEGER DEFAULT 0")
-    if "client_contact" not in appt_cols:
-        cur.execute("ALTER TABLE appointments ADD COLUMN client_contact TEXT DEFAULT ''")
-    if "client_notified" not in appt_cols:
-        cur.execute("ALTER TABLE appointments ADD COLUMN client_notified INTEGER DEFAULT 0")
+        cur.execute("PRAGMA table_info(appointments)")
+        appt_cols = [row["name"] for row in cur.fetchall()]
+        for col_name, col_sql in [
+            ("is_new", "ALTER TABLE appointments ADD COLUMN is_new INTEGER DEFAULT 0"),
+            ("client_contact", "ALTER TABLE appointments ADD COLUMN client_contact TEXT DEFAULT ''"),
+            ("client_notified", "ALTER TABLE appointments ADD COLUMN client_notified INTEGER DEFAULT 0"),
+        ]:
+            if col_name not in appt_cols:
+                cur.execute(col_sql)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS push_subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            endpoint TEXT UNIQUE NOT NULL,
-            subscription_json TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'admin',
-            client_contact TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS push_subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint TEXT UNIQUE NOT NULL,
+                subscription_json TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'admin',
+                client_contact TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
 
-    cur.execute("PRAGMA table_info(push_subscriptions)")
-    push_cols = [row["name"] for row in cur.fetchall()]
-    if "role" not in push_cols:
-        cur.execute("ALTER TABLE push_subscriptions ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
-    if "client_contact" not in push_cols:
-        cur.execute("ALTER TABLE push_subscriptions ADD COLUMN client_contact TEXT NOT NULL DEFAULT ''")
+        cur.execute("PRAGMA table_info(push_subscriptions)")
+        push_cols = [row["name"] for row in cur.fetchall()]
+        for col_name, col_sql in [
+            ("role", "ALTER TABLE push_subscriptions ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'"),
+            ("client_contact", "ALTER TABLE push_subscriptions ADD COLUMN client_contact TEXT NOT NULL DEFAULT ''"),
+        ]:
+            if col_name not in push_cols:
+                cur.execute(col_sql)
 
-    cur.execute("SELECT COUNT(*) AS cnt FROM salon_settings")
-    if cur.fetchone()["cnt"] == 0:
-        cur.execute(
-            """
-            INSERT INTO salon_settings (id, work_start, work_end, slot_step_min, hygiene_note, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?)
-            """,
-            (
-                WORK_START,
-                WORK_END,
-                SLOT_STEP_MIN,
-                "Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.",
-                datetime.now().isoformat(),
-            ),
-        )
+        cur.execute("SELECT COUNT(*) AS cnt FROM salon_settings")
+        if cur.fetchone()["cnt"] == 0:
+            cur.execute(
+                """
+                INSERT INTO salon_settings (id, work_start, work_end, slot_step_min, hygiene_note, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?)
+                """,
+                (
+                    WORK_START,
+                    WORK_END,
+                    SLOT_STEP_MIN,
+                    "Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.",
+                    datetime.now().isoformat(),
+                ),
+            )
 
-    cur.execute("SELECT COUNT(*) AS cnt FROM services")
-    if cur.fetchone()["cnt"] == 0:
-        default_services = [
-            ("Thonj", "Manikyr me Xhel (Gel Polish)", 60, 15.0, "Pastrim kutikulash, formësim dhe xhel me shkëlqim vishnje."),
-            ("Thonj", "Zgjatje me Tipsa / Xhel", 90, 25.0, "Zgjatje natyrale ose të gjata me përforcim xheli."),
-            ("Thonj", "Pedikyr Estetik + Xhel", 75, 22.0, "Trajtim i plotë i shputave dhe ngjyrë xheli."),
-            ("Qerpikë", "Lash Lift & Tint (Ngritje Qerpikësh)", 60, 25.0, "Ngritje dhe ngjyrosje për pamje të hapur e natyrale."),
-            ("Qerpikë", "Zgjatje Qerpikësh Classic / Volume", 120, 35.0, "Fije të lehta dhe të buta të përshtatura për formën e syrit."),
-            ("Vetulla", "Laminim Vetullash + Formësim", 45, 20.0, "Rregullim, ushqim dhe formësim i saktë i vetullave."),
-            ("Vetulla", "Dizajn, Depilim & Ngjyrosje Vetullash", 30, 12.0, "Pastrim dhe nuancim harmonik sipas fizionomisë."),
-            ("Kombinim", "Paketa Grande: Manikyr Xhel + Laminim Vetullash", 105, 32.0, "Kombinim ideal për thonj të kuruar dhe vetulla të rregulluara."),
-            ("Kombinim", "Kombo Qerpikë (Lash Lift) + Vetulla (Dizajn & Tint)", 90, 33.0, "Pamje e freskët e syve pa nevojë për grim të përditshëm."),
-            ("Kombinim", "Total Glow: Thonj Xhel + Qerpikë + Vetulla", 150, 52.0, "Trajtim i plotë i kombinuar për thonj, qerpikë dhe vetulla."),
-        ]
-        cur.executemany(
-            "INSERT INTO services (category, name, duration_min, price, description) VALUES (?, ?, ?, ?, ?)",
-            default_services,
-        )
+        cur.execute("SELECT COUNT(*) AS cnt FROM services")
+        if cur.fetchone()["cnt"] == 0:
+            default_services = [
+                ("Thonj", "Manikyr me Xhel (Gel Polish)", 60, 15.0, "Pastrim kutikulash, formësim dhe xhel me shkëlqim vishnje."),
+                ("Thonj", "Zgjatje me Tipsa / Xhel", 90, 25.0, "Zgjatje natyrale ose të gjata me përforcim xheli."),
+                ("Thonj", "Pedikyr Estetik + Xhel", 75, 22.0, "Trajtim i plotë i shputave dhe ngjyrë xheli."),
+                ("Qerpikë", "Lash Lift & Tint (Ngritje Qerpikësh)", 60, 25.0, "Ngritje dhe ngjyrosje për pamje të hapur e natyrale."),
+                ("Qerpikë", "Zgjatje Qerpikësh Classic / Volume", 120, 35.0, "Fije të lehta dhe të buta të përshtatura për formën e syrit."),
+                ("Vetulla", "Laminim Vetullash + Formësim", 45, 20.0, "Rregullim, ushqim dhe formësim i saktë i vetullave."),
+                ("Vetulla", "Dizajn, Depilim & Ngjyrosje Vetullash", 30, 12.0, "Pastrim dhe nuancim harmonik sipas fizionomisë."),
+                ("Kombinim", "Paketa Grande: Manikyr Xhel + Laminim Vetullash", 105, 32.0, "Kombinim ideal për thonj të kuruar dhe vetulla të rregulluara."),
+                ("Kombinim", "Kombo Qerpikë (Lash Lift) + Vetulla (Dizajn & Tint)", 90, 33.0, "Pamje e freskët e syve pa nevojë për grim të përditshëm."),
+                ("Kombinim", "Total Glow: Thonj Xhel + Qerpikë + Vetulla", 150, 52.0, "Trajtim i plotë i kombinuar për thonj, qerpikë dhe vetulla."),
+            ]
+            cur.executemany(
+                "INSERT INTO services (category, name, duration_min, price, description) VALUES (?, ?, ?, ?, ?)",
+                default_services,
+            )
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def normalize_contact_identifier(raw_val: str) -> tuple[str, str]:
@@ -563,16 +572,18 @@ def is_client_blocked_in_db(contact_val: str = "", client_id: int | None = None)
     if not contact_val and not client_id:
         return False
     conn = get_db()
-    cur = conn.cursor()
-    row = None
-    if client_id:
-        cur.execute("SELECT is_blocked FROM clients WHERE id = ?", (client_id,))
-        row = cur.fetchone()
-    if not row and contact_val:
-        cur.execute("SELECT is_blocked FROM clients WHERE LOWER(contact_value) = ?", (contact_val.strip().lower(),))
-        row = cur.fetchone()
-    conn.close()
-    return bool(row and row["is_blocked"] == 1)
+    try:
+        cur = conn.cursor()
+        row = None
+        if client_id:
+            cur.execute("SELECT is_blocked FROM clients WHERE id = ?", (client_id,))
+            row = cur.fetchone()
+        if not row and contact_val:
+            cur.execute("SELECT is_blocked FROM clients WHERE LOWER(contact_value) = ?", (contact_val.strip().lower(),))
+            row = cur.fetchone()
+        return bool(row and row["is_blocked"] == 1)
+    finally:
+        conn.close()
 
 
 def clear_client_session_keys() -> None:
@@ -582,18 +593,20 @@ def clear_client_session_keys() -> None:
 
 def get_salon_settings() -> dict:
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM salon_settings WHERE id = 1")
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return dict(row)
-    return {
-        "work_start": WORK_START,
-        "work_end": WORK_END,
-        "slot_step_min": SLOT_STEP_MIN,
-        "hygiene_note": "Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.",
-    }
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM salon_settings WHERE id = 1")
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+        return {
+            "work_start": WORK_START,
+            "work_end": WORK_END,
+            "slot_step_min": SLOT_STEP_MIN,
+            "hygiene_note": "Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.",
+        }
+    finally:
+        conn.close()
 
 
 def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> None:
@@ -619,8 +632,8 @@ def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> None:
                 content_encoding="aes128gcm",
                 headers={
                     "Urgency": "high",
-                    "Topic": payload_dict.get("tag", "grande-studio")[:32]
-                }
+                    "Topic": str(payload_dict.get("tag", "grande-studio"))[:32],
+                },
             )
         except WebPushException as ex:
             print(f"[WEBPUSH] Gabim dërgimi: {ex}")
@@ -631,18 +644,22 @@ def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> None:
 
     if dead_ids:
         conn = get_db()
-        cur = conn.cursor()
-        cur.executemany("DELETE FROM push_subscriptions WHERE id = ?", [(i,) for i in dead_ids])
-        conn.commit()
-        conn.close()
+        try:
+            cur = conn.cursor()
+            cur.executemany("DELETE FROM push_subscriptions WHERE id = ?", [(i,) for i in dead_ids])
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int | None = None) -> None:
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'admin'")
-    subs = cur.fetchall()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'admin'")
+        subs = cur.fetchall()
+    finally:
+        conn.close()
 
     actions = []
     if appt_id:
@@ -651,53 +668,62 @@ def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int
             {"action": "cancel_appt", "title": "❌ Anulo"},
         ]
 
-    dispatch_web_push(subs, {
-        "title": title,
-        "body": body,
-        "url": url,
-        "appt_id": appt_id,
-        "tag": f"gs-admin-{appt_id or 'alert'}",
-        "actions": actions,
-        "timestamp": datetime.now().isoformat()
-    })
+    dispatch_web_push(
+        subs,
+        {
+            "title": title,
+            "body": body,
+            "url": url,
+            "appt_id": appt_id,
+            "tag": f"gs-admin-{appt_id or 'alert'}",
+            "actions": actions,
+            "timestamp": datetime.now().isoformat(),
+        },
+    )
 
 
 def send_push_to_client(client_contact: str, title: str, body: str, url: str = "/", appt_id: int | None = None) -> None:
     conn = get_db()
-    cur = conn.cursor()
-    clean_c = (client_contact or "").strip().lower()
-    if clean_c:
-        cur.execute(
-            "SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' AND LOWER(client_contact) = ?",
-            (clean_c,),
-        )
-        subs = cur.fetchall()
-        if not subs:
-            cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' AND client_contact = ''")
+    try:
+        cur = conn.cursor()
+        clean_c = (client_contact or "").strip().lower()
+        if clean_c:
+            cur.execute(
+                "SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' AND LOWER(client_contact) = ?",
+                (clean_c,),
+            )
             subs = cur.fetchall()
-    else:
-        cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client'")
-        subs = cur.fetchall()
-    conn.close()
+            if not subs:
+                cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' AND client_contact = ''")
+                subs = cur.fetchall()
+        else:
+            cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client'")
+            subs = cur.fetchall()
+    finally:
+        conn.close()
 
-    dispatch_web_push(subs, {
-        "title": title,
-        "body": body,
-        "url": url,
-        "appt_id": appt_id,
-        "tag": f"gs-client-{appt_id or 'alert'}",
-        "actions": [],
-        "timestamp": datetime.now().isoformat()
-    })
+    dispatch_web_push(
+        subs,
+        {
+            "title": title,
+            "body": body,
+            "url": url,
+            "appt_id": appt_id,
+            "tag": f"gs-client-{appt_id or 'alert'}",
+            "actions": [],
+            "timestamp": datetime.now().isoformat(),
+        },
+    )
 
 
 def get_admin_account():
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM admin_account WHERE id = 1")
-    acc = cur.fetchone()
-    conn.close()
-    return acc
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM admin_account WHERE id = 1")
+        return cur.fetchone()
+    finally:
+        conn.close()
 
 
 def generate_temp_password(length: int = 12) -> str:
@@ -740,8 +766,13 @@ def admin_required(f):
 
 
 def time_to_min(hhmm: str) -> int:
-    h, m = map(int, hhmm.split(":"))
-    return h * 60 + m
+    try:
+        parts = str(hhmm or "09:00").split(":")
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+        return h * 60 + m
+    except Exception:
+        return 540
 
 
 def min_to_time(minutes: int) -> str:
@@ -757,16 +788,18 @@ def get_available_slots(appt_date: str, duration_min: int):
     step_min = int(settings.get("slot_step_min") or SLOT_STEP_MIN)
 
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT start_time, end_time FROM appointments
-        WHERE appt_date = ? AND status IN ('Konfirmuar', 'Në Pritje', 'Bllokuar')
-        """,
-        (appt_date,),
-    )
-    busy = [(time_to_min(r["start_time"]), time_to_min(r["end_time"])) for r in cur.fetchall()]
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT start_time, end_time FROM appointments
+            WHERE appt_date = ? AND status IN ('Konfirmuar', 'Në Pritje', 'Bllokuar')
+            """,
+            (appt_date,),
+        )
+        busy = [(time_to_min(r["start_time"]), time_to_min(r["end_time"])) for r in cur.fetchall()]
+    finally:
+        conn.close()
 
     start_m = time_to_min(w_start)
     end_m = time_to_min(w_end)
@@ -779,7 +812,7 @@ def get_available_slots(appt_date: str, duration_min: int):
         overlap = any(not (cand_end <= b_start or cand_start >= b_end) for b_start, b_end in busy)
         if not overlap:
             slots.append(min_to_time(cand_start))
-        curr += step_min
+        curr += max(15, step_min)
 
     return slots
 
@@ -789,14 +822,12 @@ def get_banner_artwork_html() -> str:
     ig_avatar_url = prepare_ig_avatar_asset()
 
     if ig_avatar_url:
-        ig_top_html = f'<img src="{ig_avatar_url}" alt="Instagram Grande Studio" class="ig-banner-avatar">'
+        ig_top_html = f'<img src="{esc(ig_avatar_url)}" alt="Instagram Grande Studio" class="ig-banner-avatar">'
     else:
-        ig_top_html = """
-        <div class="ig-banner-avatar ig-fallback-badge" aria-hidden="true">IG</div>
-        """
+        ig_top_html = '<div class="ig-banner-avatar ig-fallback-badge" aria-hidden="true">IG</div>'
 
     if nails_url:
-        nails_bottom_html = f'<img src="{nails_url}" alt="Grande Studio Nails" class="nails-banner-bottom">'
+        nails_bottom_html = f'<img src="{esc(nails_url)}" alt="Grande Studio Nails" class="nails-banner-bottom">'
     else:
         nails_bottom_html = """
         <svg class="nails-banner-bottom" viewBox="0 0 210 68" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -810,12 +841,12 @@ def get_banner_artwork_html() -> str:
 
 def get_ig_nav_button_html() -> str:
     return f"""
-    <a href="{IG_WEB_URL}"
-       data-ig-app="{IG_APP_URL}"
-       data-ig-web="{IG_WEB_URL}"
+    <a href="{esc(IG_WEB_URL)}"
+       data-ig-app="{esc(IG_APP_URL)}"
+       data-ig-web="{esc(IG_WEB_URL)}"
        onclick="openInstagramProfile(event)"
        class="btn-3d btn-ig-3d"
-       title="Hap Instagramin @{IG_USERNAME}">
+       title="Hap Instagramin @{esc(IG_USERNAME)}">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect>
         <path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path>
@@ -1561,19 +1592,23 @@ def render_iphone_shell(
     canonical_url = f"{base_url}/" if base_url else "/"
     icon_url = f"{base_url}/static/icon-512.png" if base_url else "/static/icon-512.png"
 
-    schema_json = json.dumps({
-        "@context": "https://schema.org",
-        "@type": "BeautySalon",
-        "name": "Grande Studio",
-        "description": description,
-        "url": canonical_url,
-        "image": icon_url,
-        "sameAs": [IG_WEB_URL],
-        "priceRange": "$$"
-    }, ensure_ascii=False)
+    schema_json = json.dumps(
+        {
+            "@context": "https://schema.org",
+            "@type": "BeautySalon",
+            "name": "Grande Studio",
+            "description": description,
+            "url": canonical_url,
+            "image": icon_url,
+            "sameAs": [IG_WEB_URL],
+            "priceRange": "$$",
+        },
+        ensure_ascii=False,
+    )
 
     push_role = "admin" if role_tag == "admin" else "client"
-    safe_client_contact = (client_contact_tag or "").replace("'", "").strip().lower()
+    safe_client_contact = (client_contact_tag or "").replace("'", "").replace("\\", "").strip().lower()
+    safe_role_tag = (role_tag or "client").replace("'", "").replace("\\", "").strip()
 
     return f"""
     <!doctype html>
@@ -1581,18 +1616,18 @@ def render_iphone_shell(
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-      <title>{title}</title>
-      <meta name="description" content="{description}">
+      <title>{esc(title)}</title>
+      <meta name="description" content="{esc(description)}">
       <meta name="keywords" content="Grande Studio, thonj, qerpikë, vetulla, manikyr me xhel, lash lift, laminim vetullash, rezervim online, sallon bukurie">
       <meta name="robots" content="index, follow, max-image-preview:large">
-      <link rel="canonical" href="{canonical_url}">
+      <link rel="canonical" href="{esc(canonical_url)}">
 
       <meta property="og:type" content="website">
       <meta property="og:site_name" content="Grande Studio">
-      <meta property="og:title" content="{title}">
-      <meta property="og:description" content="{description}">
-      <meta property="og:url" content="{canonical_url}">
-      <meta property="og:image" content="{icon_url}">
+      <meta property="og:title" content="{esc(title)}">
+      <meta property="og:description" content="{esc(description)}">
+      <meta property="og:url" content="{esc(canonical_url)}">
+      <meta property="og:image" content="{esc(icon_url)}">
 
       <meta name="theme-color" content="#72091d">
       <meta name="mobile-web-app-capable" content="yes">
@@ -1622,7 +1657,7 @@ def render_iphone_shell(
         </div>
       </div>
       <script>
-        const CURRENT_ROLE = '{role_tag}';
+        const CURRENT_ROLE = '{safe_role_tag}';
         const PUSH_SUB_ROLE = '{push_role}';
         const PUSH_CLIENT_CONTACT = '{safe_client_contact}';
 
@@ -1817,14 +1852,14 @@ def manifest():
             "src": "/static/icon-192.png",
             "sizes": "192x192",
             "type": "image/png",
-            "purpose": "any maskable"
+            "purpose": "any maskable",
         },
         {
             "src": "/static/icon-512.png",
             "sizes": "512x512",
             "type": "image/png",
-            "purpose": "any maskable"
-        }
+            "purpose": "any maskable",
+        },
     ]
 
     resp = jsonify({
@@ -1847,7 +1882,7 @@ def manifest():
 @app.route("/sw.js")
 def service_worker():
     js = """
-    const CACHE_NAME = 'grande-studio-v8';
+    const CACHE_NAME = 'grande-studio-v9';
     const CORE_ASSETS = [
       '/manifest.json',
       '/static/icon-192.png',
@@ -2040,20 +2075,22 @@ def api_push_subscribe():
     client_contact = (session.get("client_contact") or data.get("client_contact") or "").strip().lower()
 
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO push_subscriptions (endpoint, subscription_json, role, client_contact, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(endpoint) DO UPDATE SET
-            subscription_json = excluded.subscription_json,
-            role = excluded.role,
-            client_contact = CASE WHEN excluded.client_contact != '' THEN excluded.client_contact ELSE push_subscriptions.client_contact END
-        """,
-        (data["endpoint"], json.dumps(data), role, client_contact, datetime.now().isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO push_subscriptions (endpoint, subscription_json, role, client_contact, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(endpoint) DO UPDATE SET
+                subscription_json = excluded.subscription_json,
+                role = excluded.role,
+                client_contact = CASE WHEN excluded.client_contact != '' THEN excluded.client_contact ELSE push_subscriptions.client_contact END
+            """,
+            (data["endpoint"], json.dumps(data), role, client_contact, datetime.now().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return jsonify({"ok": True, "role": role})
 
 
@@ -2090,27 +2127,28 @@ def api_push_action():
         return jsonify({"ok": False, "error": "Të dhëna të pavlefshme"}), 400
 
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT a.*, s.name AS service_name
-        FROM appointments a
-        LEFT JOIN services s ON a.service_id = s.id
-        WHERE a.id = ?
-        """,
-        (appt_id,),
-    )
-    appt = cur.fetchone()
-    if not appt:
-        conn.close()
-        return jsonify({"ok": False, "error": "Termini nuk u gjet"}), 404
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT a.*, s.name AS service_name
+            FROM appointments a
+            LEFT JOIN services s ON a.service_id = s.id
+            WHERE a.id = ?
+            """,
+            (appt_id,),
+        )
+        appt = cur.fetchone()
+        if not appt:
+            return jsonify({"ok": False, "error": "Termini nuk u gjet"}), 404
 
-    cur.execute(
-        "UPDATE appointments SET status = ?, is_new = 0, client_notified = 0 WHERE id = ?",
-        (new_status, appt_id),
-    )
-    conn.commit()
-    conn.close()
+        cur.execute(
+            "UPDATE appointments SET status = ?, is_new = 0, client_notified = 0 WHERE id = ?",
+            (new_status, appt_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
     svc_title = appt["service_name"] or "Trajtim"
     if new_status == "Konfirmuar":
@@ -2141,34 +2179,36 @@ def api_client_status_updates():
         return jsonify({"updates": [], "reset_pending": False, "reset_token": ""})
 
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, is_blocked, reset_pending, reset_token FROM clients WHERE LOWER(contact_value) = ?",
-        (contact,),
-    )
-    cli = cur.fetchone()
-    if cli and cli["is_blocked"] == 1:
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, is_blocked, reset_pending, reset_token FROM clients WHERE LOWER(contact_value) = ?",
+            (contact,),
+        )
+        cli = cur.fetchone()
+        if cli and cli["is_blocked"] == 1:
+            return jsonify({"updates": [], "blocked": True, "reset_pending": False, "reset_token": ""})
+
+        reset_pending = bool(cli and cli["reset_pending"] == 1)
+        reset_token = (cli["reset_token"] if cli else "") or ""
+
+        cur.execute(
+            """
+            SELECT a.id, a.appt_date, a.start_time, a.status, s.name AS service_name
+            FROM appointments a
+            LEFT JOIN services s ON a.service_id = s.id
+            WHERE LOWER(a.client_contact) = ? AND a.client_notified = 0 AND a.status IN ('Konfirmuar', 'Anuluar')
+            ORDER BY a.id DESC
+            """,
+            (contact,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        if rows:
+            cur.executemany("UPDATE appointments SET client_notified = 1 WHERE id = ?", [(r["id"],) for r in rows])
+            conn.commit()
+    finally:
         conn.close()
-        return jsonify({"updates": [], "blocked": True, "reset_pending": False, "reset_token": ""})
 
-    reset_pending = bool(cli and cli["reset_pending"] == 1)
-    reset_token = (cli["reset_token"] if cli else "") or ""
-
-    cur.execute(
-        """
-        SELECT a.id, a.appt_date, a.start_time, a.status, s.name AS service_name
-        FROM appointments a
-        LEFT JOIN services s ON a.service_id = s.id
-        WHERE LOWER(a.client_contact) = ? AND a.client_notified = 0 AND a.status IN ('Konfirmuar', 'Anuluar')
-        ORDER BY a.id DESC
-        """,
-        (contact,),
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-    if rows:
-        cur.executemany("UPDATE appointments SET client_notified = 1 WHERE id = ?", [(r["id"],) for r in rows])
-        conn.commit()
-    conn.close()
     return jsonify({
         "updates": rows,
         "blocked": False,
@@ -2181,19 +2221,21 @@ def api_client_status_updates():
 @admin_required
 def api_admin_new_bookings():
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT a.id, a.client_name, a.client_phone, a.appt_date, a.start_time, a.end_time, a.notes, a.status, a.created_at,
-               s.name AS service_name, s.category
-        FROM appointments a
-        LEFT JOIN services s ON a.service_id = s.id
-        WHERE a.is_new = 1 AND a.status IN ('Në Pritje', 'Konfirmuar')
-        ORDER BY a.id DESC
-        """
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT a.id, a.client_name, a.client_phone, a.client_contact, a.appt_date, a.start_time, a.end_time,
+                   a.notes, a.status, a.created_at, s.name AS service_name, s.category, s.price
+            FROM appointments a
+            LEFT JOIN services s ON a.service_id = s.id
+            WHERE a.is_new = 1 AND a.status IN ('Në Pritje', 'Konfirmuar')
+            ORDER BY a.id DESC
+            """
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
     return jsonify({"count": len(rows), "bookings": rows})
 
 
@@ -2210,17 +2252,19 @@ def api_admin_auto_save_settings():
     hygiene_note = (data.get("hygiene_note") or "").strip()
 
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE salon_settings
-        SET work_start = ?, work_end = ?, slot_step_min = ?, hygiene_note = ?, updated_at = ?
-        WHERE id = 1
-        """,
-        (w_start, w_end, max(15, step_min), hygiene_note, datetime.now().isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE salon_settings
+            SET work_start = ?, work_end = ?, slot_step_min = ?, hygiene_note = ?, updated_at = ?
+            WHERE id = 1
+            """,
+            (w_start, w_end, max(15, step_min), hygiene_note, datetime.now().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return jsonify({"ok": True, "saved_at": datetime.now().strftime("%H:%M:%S")})
 
 
@@ -2232,10 +2276,13 @@ def api_slots():
         return jsonify({"slots": []})
 
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT duration_min FROM services WHERE id = ?", (service_id,))
-    row = cur.fetchone()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT duration_min FROM services WHERE id = ?", (service_id,))
+        row = cur.fetchone()
+    finally:
+        conn.close()
+
     if not row:
         return jsonify({"slots": []})
 
@@ -2272,13 +2319,6 @@ def index():
     ig_nav_html = get_ig_nav_button_html()
     settings = get_salon_settings()
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM services ORDER BY CASE category WHEN 'Kombinim' THEN 1 WHEN 'Thonj' THEN 2 WHEN 'Qerpikë' THEN 3 ELSE 4 END, id"
-    )
-    services = cur.fetchall()
-
     msg = None
     msg_type = "ok"
     active_tab = request.form.get("active_tab") or request.args.get("tab") or "book"
@@ -2287,263 +2327,274 @@ def index():
 
     reset_token_param = (request.args.get("reset_token") or "").strip()
     pending_reset_client = None
-
-    if reset_token_param:
-        cur.execute("SELECT * FROM clients WHERE reset_pending = 1 AND reset_token = ? AND is_blocked = 0", (reset_token_param,))
-        pending_reset_client = cur.fetchone()
-    elif session.get("client_id"):
-        cur.execute("SELECT * FROM clients WHERE id = ? AND reset_pending = 1 AND is_blocked = 0", (session["client_id"],))
-        pending_reset_client = cur.fetchone()
-
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    if request.method == "POST":
-        post_mode = request.form.get("post_mode", "booking")
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM services ORDER BY CASE category WHEN 'Kombinim' THEN 1 WHEN 'Thonj' THEN 2 WHEN 'Qerpikë' THEN 3 ELSE 4 END, id"
+        )
+        services = cur.fetchall()
 
-        try:
-            if post_mode == "client_login":
-                raw_contact = (request.form.get("login_contact") or "").strip()
-                raw_password = request.form.get("login_password") or ""
-                _, c_val = normalize_contact_identifier(raw_contact)
+        if reset_token_param:
+            cur.execute("SELECT * FROM clients WHERE reset_pending = 1 AND reset_token = ? AND is_blocked = 0", (reset_token_param,))
+            pending_reset_client = cur.fetchone()
+        elif session.get("client_id"):
+            cur.execute("SELECT * FROM clients WHERE id = ? AND reset_pending = 1 AND is_blocked = 0", (session["client_id"],))
+            pending_reset_client = cur.fetchone()
 
-                if not c_val or not raw_password:
-                    msg = "Ju lutem shkruani Email-in ose Instagram-in dhe passwordin tuaj."
-                    msg_type = "err"
-                else:
-                    cur.execute("SELECT * FROM clients WHERE LOWER(contact_value) = ?", (c_val.lower(),))
-                    existing_client = cur.fetchone()
-                    if not existing_client:
-                        msg = "Ky Email ose Instagram nuk është regjistruar ende. Përdorni panelin 'Regjistrohu si Klient i Ri'."
-                        msg_type = "err"
-                    elif existing_client["is_blocked"] == 1:
-                        msg = "Llogaria juaj është bllokuar nga admini dhe nuk keni qasje në aplikacion."
-                        msg_type = "err"
-                    elif existing_client["reset_pending"] == 1:
-                        pending_reset_client = existing_client
-                        msg = "Admini ka aktivizuar rivendosjen e passwordit. Shënoni passwordin e ri."
-                        msg_type = "ok"
-                    elif check_password_hash(existing_client["password_hash"], raw_password):
-                        session.permanent = True
-                        session["client_logged_in"] = True
-                        session["client_id"] = existing_client["id"]
-                        session["client_contact"] = existing_client["contact_value"]
-                        session["client_contact_type"] = existing_client["contact_type"]
-                        session["client_name"] = existing_client["full_name"] or existing_client["contact_value"]
-                        session["client_phone"] = existing_client["client_phone"] or ""
-                        msg = f"Mirësevini, {existing_client['contact_value']}! Tani mund të rezervoni terminin tuaj."
-                        msg_type = "ok"
-                    else:
-                        msg = "Passwordi është i pasaktë. Nëse e keni harruar, kontaktoni adminin për 'Reseto Passwordin'."
-                        msg_type = "err"
-                active_tab = "book"
+        if request.method == "POST":
+            post_mode = request.form.get("post_mode", "booking")
 
-            elif post_mode == "client_register":
-                full_name_in = " ".join((request.form.get("reg_full_name") or "").split())
-                raw_contact = (request.form.get("reg_contact") or "").strip()
-                phone_in = " ".join((request.form.get("reg_phone") or "").split())
-                raw_password = request.form.get("reg_password") or ""
-                c_type, c_val = normalize_contact_identifier(raw_contact)
+            try:
+                if post_mode == "client_login":
+                    raw_contact = (request.form.get("login_contact") or "").strip()
+                    raw_password = request.form.get("login_password") or ""
+                    _, c_val = normalize_contact_identifier(raw_contact)
 
-                if not full_name_in:
-                    msg = "Ju lutem shkruani Emrin dhe Mbiemrin tuaj."
-                    msg_type = "err"
-                elif not c_val:
-                    msg = "Ju lutem shkruani një Email ose Instagram të vlefshëm."
-                    msg_type = "err"
-                elif not phone_in:
-                    msg = "Ju lutem shkruani numrin e telefonit."
-                    msg_type = "err"
-                elif len(raw_password) < 4:
-                    msg = "Passwordi duhet të ketë të paktën 4 karaktere."
-                    msg_type = "err"
-                else:
-                    cur.execute("SELECT id, contact_value, is_blocked FROM clients WHERE LOWER(contact_value) = ?", (c_val.lower(),))
-                    already = cur.fetchone()
-                    if already and already["is_blocked"] == 1:
-                        msg = "Ky profil është i bllokuar nga admini dhe nuk mund të regjistrohet ose të hyjë në aplikacion."
-                        msg_type = "err"
-                    elif already:
-                        msg = f"Llogaria {already['contact_value']} ekziston tashmë. Ju lutem kyçuni te paneli i Kyçjes."
+                    if not c_val or not raw_password:
+                        msg = "Ju lutem shkruani Email-in ose Instagram-in dhe passwordin tuaj."
                         msg_type = "err"
                     else:
-                        now_iso = datetime.now().isoformat()
-                        pwd_hash = generate_password_hash(raw_password)
+                        cur.execute("SELECT * FROM clients WHERE LOWER(contact_value) = ?", (c_val.lower(),))
+                        existing_client = cur.fetchone()
+                        if not existing_client:
+                            msg = "Ky Email ose Instagram nuk është regjistruar ende. Përdorni panelin 'Regjistrohu si Klient i Ri'."
+                            msg_type = "err"
+                        elif existing_client["is_blocked"] == 1:
+                            msg = "Llogaria juaj është bllokuar nga admini dhe nuk keni qasje në aplikacion."
+                            msg_type = "err"
+                        elif existing_client["reset_pending"] == 1:
+                            pending_reset_client = existing_client
+                            msg = "Admini ka aktivizuar rivendosjen e passwordit. Shënoni passwordin e ri."
+                            msg_type = "ok"
+                        elif check_password_hash(existing_client["password_hash"], raw_password):
+                            session.permanent = True
+                            session["client_logged_in"] = True
+                            session["client_id"] = existing_client["id"]
+                            session["client_contact"] = existing_client["contact_value"]
+                            session["client_contact_type"] = existing_client["contact_type"]
+                            session["client_name"] = existing_client["full_name"] or existing_client["contact_value"]
+                            session["client_phone"] = existing_client["client_phone"] or ""
+                            msg = f"Mirësevini, {existing_client['contact_value']}! Tani mund të rezervoni terminin tuaj."
+                            msg_type = "ok"
+                        else:
+                            msg = "Passwordi është i pasaktë. Nëse e keni harruar, kontaktoni adminin për 'Reseto Passwordin'."
+                            msg_type = "err"
+                    active_tab = "book"
+
+                elif post_mode == "client_register":
+                    full_name_in = " ".join((request.form.get("reg_full_name") or "").split())
+                    raw_contact = (request.form.get("reg_contact") or "").strip()
+                    phone_in = " ".join((request.form.get("reg_phone") or "").split())
+                    raw_password = request.form.get("reg_password") or ""
+                    c_type, c_val = normalize_contact_identifier(raw_contact)
+
+                    if not full_name_in:
+                        msg = "Ju lutem shkruani Emrin dhe Mbiemrin tuaj."
+                        msg_type = "err"
+                    elif not c_val:
+                        msg = "Ju lutem shkruani një Email ose Instagram të vlefshëm."
+                        msg_type = "err"
+                    elif not phone_in:
+                        msg = "Ju lutem shkruani numrin e telefonit."
+                        msg_type = "err"
+                    elif len(raw_password) < 4:
+                        msg = "Passwordi duhet të ketë të paktën 4 karaktere."
+                        msg_type = "err"
+                    else:
+                        cur.execute("SELECT id, contact_value, is_blocked FROM clients WHERE LOWER(contact_value) = ?", (c_val.lower(),))
+                        already = cur.fetchone()
+                        if already and already["is_blocked"] == 1:
+                            msg = "Ky profil është i bllokuar nga admini dhe nuk mund të regjistrohet ose të hyjë në aplikacion."
+                            msg_type = "err"
+                        elif already:
+                            msg = f"Llogaria {already['contact_value']} ekziston tashmë. Ju lutem kyçuni te paneli i Kyçjes."
+                            msg_type = "err"
+                        else:
+                            now_iso = datetime.now().isoformat()
+                            pwd_hash = generate_password_hash(raw_password)
+                            cur.execute(
+                                """
+                                INSERT INTO clients (
+                                    full_name, contact_type, contact_value, client_phone,
+                                    password_hash, is_blocked, reset_pending, reset_token, reset_sent_via,
+                                    created_at, updated_at
+                                )
+                                VALUES (?, ?, ?, ?, ?, 0, 0, '', '', ?, ?)
+                                """,
+                                (full_name_in, c_type, c_val, phone_in, pwd_hash, now_iso, now_iso),
+                            )
+                            new_client_id = cur.lastrowid
+                            conn.commit()
+                            session.permanent = True
+                            session["client_logged_in"] = True
+                            session["client_id"] = new_client_id
+                            session["client_contact"] = c_val
+                            session["client_contact_type"] = c_type
+                            session["client_name"] = full_name_in
+                            session["client_phone"] = phone_in
+                            msg = f"Regjistrimi u krye me sukses për {full_name_in} ({c_val})! Tani mund të caktoni terminin tuaj."
+                            msg_type = "ok"
+                    active_tab = "book"
+
+                elif post_mode == "client_set_new_password":
+                    target_client_id = request.form.get("reset_client_id", type=int)
+                    target_token = (request.form.get("reset_token") or "").strip()
+                    new_pwd = request.form.get("new_client_password") or ""
+                    conf_pwd = request.form.get("confirm_client_password") or ""
+
+                    cur.execute("SELECT * FROM clients WHERE id = ? AND reset_pending = 1 AND is_blocked = 0", (target_client_id,))
+                    target_cli = cur.fetchone()
+                    if not target_cli or (target_cli["reset_token"] and target_token != target_cli["reset_token"]):
+                        msg = "Kërkesa për ndërrimin e passwordit nuk është e vlefshme."
+                        msg_type = "err"
+                    elif len(new_pwd) < 4:
+                        pending_reset_client = target_cli
+                        msg = "Passwordi i ri duhet të ketë të paktën 4 karaktere."
+                        msg_type = "err"
+                    elif new_pwd != conf_pwd:
+                        pending_reset_client = target_cli
+                        msg = "Passwordet nuk përputhen. Shënoni sërish passwordin e ri."
+                        msg_type = "err"
+                    else:
                         cur.execute(
                             """
-                            INSERT INTO clients (
-                                full_name, contact_type, contact_value, client_phone,
-                                password_hash, is_blocked, reset_pending, reset_token, reset_sent_via,
-                                created_at, updated_at
-                            )
-                            VALUES (?, ?, ?, ?, ?, 0, 0, '', '', ?, ?)
+                            UPDATE clients
+                            SET password_hash = ?, reset_pending = 0, reset_token = '', updated_at = ?
+                            WHERE id = ?
                             """,
-                            (full_name_in, c_type, c_val, phone_in, pwd_hash, now_iso, now_iso),
+                            (generate_password_hash(new_pwd), datetime.now().isoformat(), target_cli["id"]),
                         )
-                        new_client_id = cur.lastrowid
                         conn.commit()
+                        pending_reset_client = None
                         session.permanent = True
                         session["client_logged_in"] = True
-                        session["client_id"] = new_client_id
-                        session["client_contact"] = c_val
-                        session["client_contact_type"] = c_type
-                        session["client_name"] = full_name_in
-                        session["client_phone"] = phone_in
-                        msg = f"Regjistrimi u krye me sukses për {full_name_in} ({c_val})! Tani mund të caktoni terminin tuaj."
+                        session["client_id"] = target_cli["id"]
+                        session["client_contact"] = target_cli["contact_value"]
+                        session["client_contact_type"] = target_cli["contact_type"]
+                        session["client_name"] = target_cli["full_name"] or target_cli["contact_value"]
+                        session["client_phone"] = target_cli["client_phone"] or ""
+                        msg = f"Passwordi i ri u ruajt dhe jeni kyçur automatikisht si {target_cli['contact_value']}!"
                         msg_type = "ok"
-                active_tab = "book"
-
-            elif post_mode == "client_set_new_password":
-                target_client_id = request.form.get("reset_client_id", type=int)
-                target_token = (request.form.get("reset_token") or "").strip()
-                new_pwd = request.form.get("new_client_password") or ""
-                conf_pwd = request.form.get("confirm_client_password") or ""
-
-                cur.execute("SELECT * FROM clients WHERE id = ? AND reset_pending = 1 AND is_blocked = 0", (target_client_id,))
-                target_cli = cur.fetchone()
-                if not target_cli or (target_cli["reset_token"] and target_token != target_cli["reset_token"]):
-                    msg = "Kërkesa për ndërrimin e passwordit nuk është e vlefshme."
-                    msg_type = "err"
-                elif len(new_pwd) < 4:
-                    pending_reset_client = target_cli
-                    msg = "Passwordi i ri duhet të ketë të paktën 4 karaktere."
-                    msg_type = "err"
-                elif new_pwd != conf_pwd:
-                    pending_reset_client = target_cli
-                    msg = "Passwordet nuk përputhen. Shënoni sërish passwordin e ri."
-                    msg_type = "err"
-                else:
-                    cur.execute(
-                        """
-                        UPDATE clients
-                        SET password_hash = ?, reset_pending = 0, reset_token = '', updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (generate_password_hash(new_pwd), datetime.now().isoformat(), target_cli["id"]),
-                    )
-                    conn.commit()
-                    pending_reset_client = None
-                    session.permanent = True
-                    session["client_logged_in"] = True
-                    session["client_id"] = target_cli["id"]
-                    session["client_contact"] = target_cli["contact_value"]
-                    session["client_contact_type"] = target_cli["contact_type"]
-                    session["client_name"] = target_cli["full_name"] or target_cli["contact_value"]
-                    session["client_phone"] = target_cli["client_phone"] or ""
-                    msg = f"Passwordi i ri u ruajt dhe jeni kyçur automatikisht si {target_cli['contact_value']}!"
-                    msg_type = "ok"
-                active_tab = "book"
-
-            else:
-                if not (session.get("client_logged_in") or is_admin_viewing):
-                    msg = "Për të rezervuar termin, duhet fillimisht të regjistroheni ose të kyçeni në llogarinë tuaj!"
-                    msg_type = "err"
                     active_tab = "book"
+
                 else:
-                    raw_contact_book = (session.get("client_contact") or request.form.get("client_contact") or "").strip()
-                    _, norm_contact_book = normalize_contact_identifier(raw_contact_book)
-                    if session.get("client_logged_in") and is_client_blocked_in_db(norm_contact_book, session.get("client_id")):
-                        clear_client_session_keys()
-                        msg = "Llogaria juaj është bllokuar nga admini dhe nuk mund të bëni rezervime."
+                    if not (session.get("client_logged_in") or is_admin_viewing):
+                        msg = "Për të rezervuar termin, duhet fillimisht të regjistroheni ose të kyçeni në llogarinë tuaj!"
                         msg_type = "err"
                         active_tab = "book"
                     else:
-                        client_name = (request.form.get("client_name") or session.get("client_name") or norm_contact_book).strip()
-                        client_phone = (request.form.get("client_phone") or session.get("client_phone") or "").strip()
-                        service_id = request.form.get("service_id", type=int)
-                        appt_date = (request.form.get("appt_date") or "").strip()
-                        start_time = (request.form.get("start_time") or "").strip()
-                        notes = (request.form.get("notes") or "").strip()
-
-                        cur.execute("SELECT * FROM services WHERE id = ?", (service_id,))
-                        svc = cur.fetchone()
-
-                        if not (norm_contact_book or client_name) or not client_phone or not svc or not appt_date or not start_time:
-                            msg = "Ju lutem plotësoni të gjitha fushat e detyrueshme dhe zgjidhni një orar."
+                        raw_contact_book = (session.get("client_contact") or request.form.get("client_contact") or "").strip()
+                        _, norm_contact_book = normalize_contact_identifier(raw_contact_book)
+                        if session.get("client_logged_in") and is_client_blocked_in_db(norm_contact_book, session.get("client_id")):
+                            clear_client_session_keys()
+                            msg = "Llogaria juaj është bllokuar nga admini dhe nuk mund të bëni rezervime."
                             msg_type = "err"
                             active_tab = "book"
                         else:
-                            valid_slots = get_available_slots(appt_date, svc["duration_min"])
-                            if start_time not in valid_slots:
-                                msg = "Ky orar nuk është më i lirë ose nuk mjafton për kohëzgjatjen e shërbimit."
+                            client_name = (request.form.get("client_name") or session.get("client_name") or norm_contact_book).strip()
+                            client_phone = (request.form.get("client_phone") or session.get("client_phone") or "").strip()
+                            service_id = request.form.get("service_id", type=int)
+                            appt_date = (request.form.get("appt_date") or "").strip()
+                            start_time = (request.form.get("start_time") or "").strip()
+                            notes = (request.form.get("notes") or "").strip()
+
+                            cur.execute("SELECT * FROM services WHERE id = ?", (service_id,))
+                            svc = cur.fetchone()
+
+                            if not (norm_contact_book or client_name) or not client_phone or not svc or not appt_date or not start_time:
+                                msg = "Ju lutem plotësoni të gjitha fushat e detyrueshme dhe zgjidhni një orar."
                                 msg_type = "err"
                                 active_tab = "book"
                             else:
-                                end_time = min_to_time(time_to_min(start_time) + svc["duration_min"])
-                                display_client_label = f"{client_name} ({norm_contact_book})" if norm_contact_book and norm_contact_book not in client_name else client_name
-                                cur.execute(
-                                    """
-                                    INSERT INTO appointments
-                                    (client_name, client_phone, client_contact, service_id, appt_date, start_time, end_time, notes, status, is_new, client_notified, created_at)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Në Pritje', 1, 1, ?)
-                                    """,
-                                    (
-                                        display_client_label,
-                                        client_phone,
-                                        norm_contact_book,
-                                        service_id,
-                                        appt_date,
-                                        start_time,
-                                        end_time,
-                                        notes,
-                                        datetime.now().isoformat(),
-                                    ),
-                                )
-                                new_appt_id = cur.lastrowid
-                                if session.get("client_id"):
-                                    cur.execute(
-                                        "UPDATE clients SET full_name = ?, client_phone = ?, updated_at = ? WHERE id = ?",
-                                        (client_name, client_phone, datetime.now().isoformat(), session["client_id"]),
+                                valid_slots = get_available_slots(appt_date, svc["duration_min"])
+                                if start_time not in valid_slots:
+                                    msg = "Ky orar nuk është më i lirë ose nuk mjafton për kohëzgjatjen e shërbimit."
+                                    msg_type = "err"
+                                    active_tab = "book"
+                                else:
+                                    end_time = min_to_time(time_to_min(start_time) + svc["duration_min"])
+                                    display_client_label = (
+                                        f"{client_name} ({norm_contact_book})"
+                                        if norm_contact_book and norm_contact_book not in client_name
+                                        else client_name
                                     )
-                                    session["client_phone"] = client_phone
-                                conn.commit()
+                                    cur.execute(
+                                        """
+                                        INSERT INTO appointments
+                                        (client_name, client_phone, client_contact, service_id, appt_date, start_time, end_time, notes, status, is_new, client_notified, created_at)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Në Pritje', 1, 1, ?)
+                                        """,
+                                        (
+                                            display_client_label,
+                                            client_phone,
+                                            norm_contact_book,
+                                            service_id,
+                                            appt_date,
+                                            start_time,
+                                            end_time,
+                                            notes,
+                                            datetime.now().isoformat(),
+                                        ),
+                                    )
+                                    new_appt_id = cur.lastrowid
+                                    if session.get("client_id"):
+                                        cur.execute(
+                                            "UPDATE clients SET full_name = ?, client_phone = ?, updated_at = ? WHERE id = ?",
+                                            (client_name, client_phone, datetime.now().isoformat(), session["client_id"]),
+                                        )
+                                        session["client_phone"] = client_phone
+                                    conn.commit()
 
-                                send_push_to_admins(
-                                    title=f"🔔 Kërkesë për Termin: {display_client_label}",
-                                    body=f"{svc['name']} • Data: {appt_date} në {start_time} • Tel: {client_phone}",
-                                    url="/admin",
-                                    appt_id=new_appt_id,
-                                )
+                                    send_push_to_admins(
+                                        title=f"🔔 Kërkesë për Termin: {display_client_label}",
+                                        body=f"{svc['name']} • Data: {appt_date} në {start_time} • Tel: {client_phone}",
+                                        url="/admin",
+                                        appt_id=new_appt_id,
+                                    )
 
-                                msg = f"Kërkesa për termin u dërgua për {display_client_label} më {appt_date} në ora {start_time} ({svc['name']}). Do të njoftoheni sapo admini ta konfirmojë!"
-                                msg_type = "ok"
-                                active_tab = "book"
+                                    msg = f"Kërkesa për termin u dërgua për {display_client_label} më {appt_date} në ora {start_time} ({svc['name']}). Do të njoftoheni sapo admini ta konfirmojë!"
+                                    msg_type = "ok"
+                                    active_tab = "book"
 
-        except sqlite3.IntegrityError:
-            conn.rollback()
-            msg = "Ky Email ose Instagram është i regjistruar tashmë."
-            msg_type = "err"
-        except Exception as exc:
-            conn.rollback()
-            print(f"[INDEX POST ERROR] {exc}")
-            msg = f"Ndodhi një gabim gjatë përpunimit të kërkesës: {exc}"
-            msg_type = "err"
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                msg = "Ky Email ose Instagram është i regjistruar tashmë."
+                msg_type = "err"
+            except Exception as exc:
+                conn.rollback()
+                print(f"[INDEX POST ERROR] {exc}")
+                msg = f"Ndodhi një gabim gjatë përpunimit të kërkesës: {exc}"
+                msg_type = "err"
 
-    saved_client_contact = session.get("client_contact", "")
-    saved_client_name = session.get("client_name", "")
-    saved_client_phone = session.get("client_phone", "")
-    is_client_logged_in = bool(session.get("client_logged_in") and saved_client_contact)
-    can_book_now = is_client_logged_in or is_admin_viewing
-    role_tag = "admin" if is_admin_viewing else ("client_logged_in" if is_client_logged_in else "client")
+        saved_client_contact = session.get("client_contact", "")
+        saved_client_name = session.get("client_name", "")
+        saved_client_phone = session.get("client_phone", "")
+        is_client_logged_in = bool(session.get("client_logged_in") and saved_client_contact)
+        can_book_now = is_client_logged_in or is_admin_viewing
+        role_tag = "admin" if is_admin_viewing else ("client_logged_in" if is_client_logged_in else "client")
 
-    client_appts = []
-    if saved_client_contact:
-        cur.execute(
-            """
-            SELECT a.*, s.name AS service_name, s.price
-            FROM appointments a
-            LEFT JOIN services s ON a.service_id = s.id
-            WHERE LOWER(a.client_contact) = ?
-            ORDER BY a.appt_date DESC, a.start_time DESC
-            LIMIT 5
-            """,
-            (saved_client_contact.lower(),),
-        )
-        client_appts = cur.fetchall()
-
-    conn.close()
+        client_appts = []
+        if saved_client_contact:
+            cur.execute(
+                """
+                SELECT a.*, s.name AS service_name, s.price
+                FROM appointments a
+                LEFT JOIN services s ON a.service_id = s.id
+                WHERE LOWER(a.client_contact) = ?
+                ORDER BY a.appt_date DESC, a.start_time DESC
+                LIMIT 5
+                """,
+                (saved_client_contact.lower(),),
+            )
+            client_appts = cur.fetchall()
+    finally:
+        conn.close()
 
     service_options = "\n".join(
-        f'<option value="{s["id"]}" data-cat="{s["category"]}" data-dur="{s["duration_min"]}">[{s["category"]}] {s["name"]} — {s["duration_min"]} min ({s["price"]:.0f}€)</option>'
+        f'<option value="{s["id"]}" data-cat="{esc(s["category"])}" data-dur="{s["duration_min"]}">[{esc(s["category"])}] {esc(s["name"])} — {s["duration_min"]} min ({s["price"]:.0f}€)</option>'
         for s in services
     )
 
@@ -2552,7 +2603,7 @@ def index():
         cls = "alert-ok" if msg_type == "ok" else "alert-err"
         alert_html = f"""
         <div class="alert {cls}" id="clientAlertBox">
-          <span>{msg}</span>
+          <span>{esc(msg)}</span>
           <button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button>
         </div>
         """
@@ -2566,10 +2617,10 @@ def index():
             items += f"""
             <div style="display:flex; justify-content:space-between; align-items:center; padding:7px 0; border-bottom:1px solid var(--border); font-size:0.78rem;">
               <div>
-                <b>{ca['service_name'] or 'Trajtim'}</b><br>
-                <span style="color:var(--muted);">📅 {ca['appt_date']} • ⏰ {ca['start_time']}</span>
+                <b>{esc(ca['service_name'] or 'Trajtim')}</b><br>
+                <span style="color:var(--muted);">📅 {esc(ca['appt_date'])} • ⏰ {esc(ca['start_time'])}</span>
               </div>
-              <span class="badge {b_cls}">{st}</span>
+              <span class="badge {b_cls}">{esc(st)}</span>
             </div>
             """
         client_appts_html = f"""
@@ -2588,13 +2639,13 @@ def index():
               <b style="color:#72091d; font-size:1rem;">🔐 Shëno passwordin e ri</b>
             </div>
             <p style="margin:0 0 10px; font-size:0.78rem; color:var(--muted); line-height:1.45;">
-              Llogaria: <b>{pending_reset_client['contact_value']}</b><br>
+              Llogaria: <b>{esc(pending_reset_client['contact_value'])}</b><br>
               Shënoni passwordin e ri për të rikthyer qasjen në aplikacion.
             </p>
             <form method="POST">
               <input type="hidden" name="post_mode" value="client_set_new_password">
               <input type="hidden" name="reset_client_id" value="{pending_reset_client['id']}">
-              <input type="hidden" name="reset_token" value="{pending_reset_client['reset_token']}">
+              <input type="hidden" name="reset_token" value="{esc(pending_reset_client['reset_token'])}">
               <label for="new_client_password">Shëno passwordin e ri</label>
               <input type="password" name="new_client_password" id="new_client_password" placeholder="Shkruani passwordin e ri..." required autofocus>
               <label for="confirm_client_password">Konfirmo passwordin e ri</label>
@@ -2627,7 +2678,7 @@ def index():
         <div class="card-3d" style="padding:10px 12px; background:#fff9fb;">
           <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
             <div style="font-size:0.78rem; color:var(--vishnje-dark);">
-              <b>👤 Klienti i kyçur:</b> {saved_client_contact}
+              <b>👤 Klienti i kyçur:</b> {esc(saved_client_contact)}
             </div>
             <div style="display:flex; gap:5px;">
               <button type="button" onclick="testBackgroundLockScreenPush()" class="btn-sm-3d btn-seen" style="font-size:0.68rem;">🔔 Testo Njoftimin</button>
@@ -2640,7 +2691,7 @@ def index():
         </div>
         """
     else:
-        client_auth_panels_html = f"""
+        client_auth_panels_html = """
         <div class="card-3d" style="padding:13px; border: 1.5px solid var(--vishnje-bright);">
           <h2>🔐 Kyçu (Klient i Regjistruar Më Herët)</h2>
           <p style="margin:0 0 8px; font-size:0.76rem; color:var(--muted); line-height:1.35;">
@@ -2725,11 +2776,11 @@ def index():
               <div class="row-2">
                 <div>
                   <label for="client_contact">Llogaria (Email / IG)</label>
-                  <input type="text" name="client_contact" id="client_contact" value="{saved_client_contact}" {contact_readonly_attr} placeholder="p.sh. sara@email.com ose @sara.beauty" required>
+                  <input type="text" name="client_contact" id="client_contact" value="{esc(saved_client_contact)}" {contact_readonly_attr} placeholder="p.sh. sara@email.com ose @sara.beauty" required>
                 </div>
                 <div>
                   <label for="client_phone">Numri i Telefonit *</label>
-                  <input type="tel" name="client_phone" id="client_phone" value="{saved_client_phone}" placeholder="p.sh. +383 44 ..." required>
+                  <input type="tel" name="client_phone" id="client_phone" value="{esc(saved_client_phone)}" placeholder="p.sh. +383 44 ..." required>
                 </div>
               </div>
 
@@ -2877,9 +2928,9 @@ def index():
           <div class="card-3d">
             <h2>Orari &amp; Standardet — Grande Studio</h2>
             <p style="margin:0; color:var(--muted); font-size:0.84rem; line-height:1.55;">
-              • <b>Orari i rezervimeve:</b> {w_start} – {w_end} (llogaritja e kohëzgjatjes bëhet automatikisht).<br>
-              • <b>Higjiena &amp; Sterilizimi:</b> {hygiene_note}<br>
-              • <b>Instagram:</b> <a href="{IG_WEB_URL}" data-ig-app="{IG_APP_URL}" data-ig-web="{IG_WEB_URL}" onclick="openInstagramProfile(event)" style="color:var(--vishnje);font-weight:700;">@{IG_USERNAME}</a>
+              • <b>Orari i rezervimeve:</b> {esc(w_start)} – {esc(w_end)} (llogaritja e kohëzgjatjes bëhet automatikisht).<br>
+              • <b>Higjiena &amp; Sterilizimi:</b> {esc(hygiene_note)}<br>
+              • <b>Instagram:</b> <a href="{esc(IG_WEB_URL)}" data-ig-app="{esc(IG_APP_URL)}" data-ig-web="{esc(IG_WEB_URL)}" onclick="openInstagramProfile(event)" style="color:var(--vishnje);font-weight:700;">@{esc(IG_USERNAME)}</a>
             </p>
           </div>
         </div>
@@ -3009,27 +3060,31 @@ def index():
               return;
             }}
             slotsEl.innerHTML = '<span style="color:#6e4e57;font-size:0.82rem;">Po kontrollohen oraret e lira...</span>';
-            const res = await fetch(`/api/slots?date=${{encodeURIComponent(dateEl.value)}}&service_id=${{encodeURIComponent(svcEl.value)}}`);
-            const data = await res.json();
-            slotsEl.innerHTML = '';
+            try {{
+              const res = await fetch(`/api/slots?date=${{encodeURIComponent(dateEl.value)}}&service_id=${{encodeURIComponent(svcEl.value)}}`);
+              const data = await res.json();
+              slotsEl.innerHTML = '';
 
-            if (!data.slots || data.slots.length === 0) {{
-              slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Nuk ka orare të lira për këtë datë dhe kohëzgjatje.</span>';
-              return;
+              if (!data.slots || data.slots.length === 0) {{
+                slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Nuk ka orare të lira për këtë datë dhe kohëzgjatje.</span>';
+                return;
+              }}
+
+              data.slots.forEach(slot => {{
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'slot-3d';
+                btn.textContent = slot;
+                btn.onclick = () => {{
+                  document.querySelectorAll('.slot-3d').forEach(b => b.classList.remove('active'));
+                  btn.classList.add('active');
+                  startInput.value = slot;
+                }};
+                slotsEl.appendChild(btn);
+              }});
+            }} catch (e) {{
+              slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Gabim gjatë ngarkimit të orareve.</span>';
             }}
-
-            data.slots.forEach(slot => {{
-              const btn = document.createElement('button');
-              btn.type = 'button';
-              btn.className = 'slot-3d';
-              btn.textContent = slot;
-              btn.onclick = () => {{
-                document.querySelectorAll('.slot-3d').forEach(b => b.classList.remove('active'));
-                btn.classList.add('active');
-                startInput.value = slot;
-              }};
-              slotsEl.appendChild(btn);
-            }});
           }}
 
           svcEl.addEventListener('change', loadSlots);
@@ -3124,22 +3179,28 @@ def admin_login():
                 err = "Fjalëkalimet nuk përputhen."
             else:
                 conn = get_db()
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    INSERT INTO admin_account (id, email, password_hash, updated_at)
-                    VALUES (1, ?, ?, ?)
-                    """,
-                    (email, generate_password_hash(pwd), datetime.now().isoformat()),
-                )
-                conn.commit()
-                conn.close()
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        INSERT INTO admin_account (id, email, password_hash, updated_at)
+                        VALUES (1, ?, ?, ?)
+                        """,
+                        (email, generate_password_hash(pwd), datetime.now().isoformat()),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
                 session.clear()
                 session.permanent = True
                 session["admin_logged_in"] = True
                 return redirect(url_for("admin_panel"))
 
-        alert_html = f'<div class="alert alert-err"><span>{err}</span><button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button></div>' if err else ""
+        alert_html = (
+            f'<div class="alert alert-err"><span>{esc(err)}</span><button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button></div>'
+            if err
+            else ""
+        )
         inner = f"""
           <header>
             <div class="header-inner">
@@ -3188,7 +3249,7 @@ def admin_login():
         else:
             email_in = request.form.get("email", "").strip().lower()
             pwd_in = request.form.get("password", "")
-            if email_in == acc["email"].strip().lower() and check_password_hash(acc["password_hash"], pwd_in):
+            if email_in == (acc["email"] or "").strip().lower() and check_password_hash(acc["password_hash"], pwd_in):
                 clear_failed_login(client_ip)
                 session.clear()
                 session.permanent = True
@@ -3197,7 +3258,11 @@ def admin_login():
             record_failed_login(client_ip)
             err = "Emaili ose fjalëkalimi është i pasaktë."
 
-    err_html = f'<div class="alert alert-err"><span>{err}</span><button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button></div>' if err else ""
+    err_html = (
+        f'<div class="alert alert-err"><span>{esc(err)}</span><button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button></div>'
+        if err
+        else ""
+    )
 
     inner = f"""
       <header>
@@ -3249,19 +3314,21 @@ def admin_reset_password():
 
     if request.method == "POST":
         entered_email = request.form.get("reset_email", "").strip().lower()
-        if entered_email != acc["email"].strip().lower():
+        if entered_email != (acc["email"] or "").strip().lower():
             msg = "Ky email nuk përputhet me emailin e regjistruar të pronarit."
             msg_type = "err"
         else:
             new_pwd = generate_temp_password(12)
             conn = get_db()
-            cur = conn.cursor()
-            cur.execute(
-                "UPDATE admin_account SET password_hash = ?, updated_at = ? WHERE id = 1",
-                (generate_password_hash(new_pwd), datetime.now().isoformat()),
-            )
-            conn.commit()
-            conn.close()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE admin_account SET password_hash = ?, updated_at = ? WHERE id = 1",
+                    (generate_password_hash(new_pwd), datetime.now().isoformat()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
             session.pop("admin_logged_in", None)
 
             sent, info_txt = send_reset_email(acc["email"], new_pwd)
@@ -3271,7 +3338,7 @@ def admin_reset_password():
     alert_html = ""
     if msg:
         cls = "alert-ok" if msg_type == "ok" else "alert-err"
-        alert_html = f'<div class="alert {cls}"><span>{msg}</span><button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button></div>'
+        alert_html = f'<div class="alert {cls}"><span>{esc(msg)}</span><button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button></div>'
 
     inner = f"""
       <header>
@@ -3320,10 +3387,12 @@ def admin_logout():
 def admin_panel():
     init_db()
     acc = get_admin_account()
+    if acc is None:
+        session.pop("admin_logged_in", None)
+        return redirect(url_for("admin_login"))
+
     ig_nav_html = get_ig_nav_button_html()
     settings = get_salon_settings()
-    conn = get_db()
-    cur = conn.cursor()
     today_str = datetime.now().strftime("%Y-%m-%d")
     feedback_msg = None
     feedback_type = "ok"
@@ -3331,253 +3400,271 @@ def admin_panel():
     external_reset_label = ""
     show_clients_modal = False
 
-    if request.method == "POST":
-        action = request.form.get("action")
+    conn = get_db()
+    try:
+        cur = conn.cursor()
 
-        if action == "delete_client":
-            client_id = request.form.get("client_id", type=int)
-            show_clients_modal = True
-            if client_id:
-                cur.execute("SELECT contact_value FROM clients WHERE id = ?", (client_id,))
-                cli_del = cur.fetchone()
-                cur.execute("DELETE FROM clients WHERE id = ?", (client_id,))
-                if cli_del:
-                    cur.execute("DELETE FROM push_subscriptions WHERE LOWER(client_contact) = ?", (cli_del["contact_value"].lower(),))
-                    if (session.get("client_contact") or "").lower() == cli_del["contact_value"].lower():
-                        clear_client_session_keys()
-                conn.commit()
-                feedback_msg = "Klienti u fshi nga databaza."
-                feedback_type = "ok"
+        if request.method == "POST":
+            action = request.form.get("action")
 
-        elif action == "toggle_block_client":
-            client_id = request.form.get("client_id", type=int)
-            show_clients_modal = True
-            if client_id:
-                cur.execute("SELECT * FROM clients WHERE id = ?", (client_id,))
-                cli_blk = cur.fetchone()
-                if cli_blk:
-                    new_blocked = 0 if cli_blk["is_blocked"] == 1 else 1
-                    cur.execute(
-                        "UPDATE clients SET is_blocked = ?, updated_at = ? WHERE id = ?",
-                        (new_blocked, datetime.now().isoformat(), client_id),
-                    )
-                    if new_blocked == 1 and (session.get("client_contact") or "").lower() == cli_blk["contact_value"].lower():
-                        clear_client_session_keys()
+            if action == "delete_client":
+                client_id = request.form.get("client_id", type=int)
+                show_clients_modal = True
+                if client_id:
+                    cur.execute("SELECT contact_value FROM clients WHERE id = ?", (client_id,))
+                    cli_del = cur.fetchone()
+                    cur.execute("DELETE FROM clients WHERE id = ?", (client_id,))
+                    if cli_del:
+                        cur.execute("DELETE FROM push_subscriptions WHERE LOWER(client_contact) = ?", (cli_del["contact_value"].lower(),))
+                        if (session.get("client_contact") or "").lower() == cli_del["contact_value"].lower():
+                            clear_client_session_keys()
                     conn.commit()
-                    if new_blocked == 1:
-                        feedback_msg = f"Klienti {cli_blk['contact_value']} u bllokua dhe nuk ka më qasje në aplikacion."
-                    else:
-                        feedback_msg = f"Klienti {cli_blk['contact_value']} u çbllokua dhe mund të hyjë sërish në aplikacion."
+                    feedback_msg = "Klienti u fshi nga databaza."
                     feedback_type = "ok"
 
-        elif action == "refresh_client_password":
-            client_id = request.form.get("client_id", type=int)
-            show_clients_modal = True
-            if client_id:
-                cur.execute("SELECT * FROM clients WHERE id = ?", (client_id,))
-                cli = cur.fetchone()
-                if cli:
-                    token = secrets.token_urlsafe(16)
-                    reset_url = f"{request.url_root.rstrip('/')}/?reset_token={token}"
-                    channel_label, ext_url = send_client_password_reset_notification(cli, reset_url)
+            elif action == "toggle_block_client":
+                client_id = request.form.get("client_id", type=int)
+                show_clients_modal = True
+                if client_id:
+                    cur.execute("SELECT * FROM clients WHERE id = ?", (client_id,))
+                    cli_blk = cur.fetchone()
+                    if cli_blk:
+                        new_blocked = 0 if cli_blk["is_blocked"] == 1 else 1
+                        cur.execute(
+                            "UPDATE clients SET is_blocked = ?, updated_at = ? WHERE id = ?",
+                            (new_blocked, datetime.now().isoformat(), client_id),
+                        )
+                        if new_blocked == 1 and (session.get("client_contact") or "").lower() == cli_blk["contact_value"].lower():
+                            clear_client_session_keys()
+                        conn.commit()
+                        if new_blocked == 1:
+                            feedback_msg = f"Klienti {cli_blk['contact_value']} u bllokua dhe nuk ka më qasje në aplikacion."
+                        else:
+                            feedback_msg = f"Klienti {cli_blk['contact_value']} u çbllokua dhe mund të hyjë sërish në aplikacion."
+                        feedback_type = "ok"
+
+            elif action == "refresh_client_password":
+                client_id = request.form.get("client_id", type=int)
+                show_clients_modal = True
+                if client_id:
+                    cur.execute("SELECT * FROM clients WHERE id = ?", (client_id,))
+                    cli = cur.fetchone()
+                    if cli:
+                        token = secrets.token_urlsafe(16)
+                        reset_url = f"{request.url_root.rstrip('/')}/?reset_token={token}"
+                        channel_label, ext_url = send_client_password_reset_notification(cli, reset_url)
+                        cur.execute(
+                            """
+                            UPDATE clients
+                            SET is_blocked = 0, reset_pending = 1, reset_token = ?, reset_sent_via = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (token, channel_label, datetime.now().isoformat(), client_id),
+                        )
+                        conn.commit()
+                        send_push_to_client(
+                            cli["contact_value"],
+                            title="🔐 Reseto Passwordin — Grande Studio",
+                            body=f"Admini dërgoi kërkesën për password të ri te {channel_label}. Klikoni për ta vendosur.",
+                            url=f"/?reset_token={token}",
+                        )
+                        external_reset_link = ext_url
+                        external_reset_label = channel_label
+                        feedback_msg = f"Njoftimi për resetimin e passwordit u dërgua te {channel_label}."
+                        feedback_type = "ok"
+
+            elif action == "mark_seen":
+                appt_id = request.form.get("appt_id", type=int)
+                if appt_id:
+                    cur.execute("UPDATE appointments SET is_new = 0 WHERE id = ?", (appt_id,))
+                    conn.commit()
+                    feedback_msg = "Njoftimi u hoq."
+                    feedback_type = "ok"
+
+            elif action == "mark_all_seen":
+                cur.execute("UPDATE appointments SET is_new = 0 WHERE is_new = 1")
+                conn.commit()
+                feedback_msg = "Të gjitha njoftimet u hoqën."
+                feedback_type = "ok"
+
+            elif action == "change_password":
+                curr_pwd = request.form.get("current_password", "")
+                new_pwd = request.form.get("new_password", "")
+                conf_pwd = request.form.get("confirm_password", "")
+
+                if not check_password_hash(acc["password_hash"], curr_pwd):
+                    feedback_msg = "Fjalëkalimi aktual është i pasaktë."
+                    feedback_type = "err"
+                elif len(new_pwd) < 6:
+                    feedback_msg = "Fjalëkalimi i ri duhet të ketë të paktën 6 karaktere."
+                    feedback_type = "err"
+                elif new_pwd != conf_pwd:
+                    feedback_msg = "Konfirmimi i fjalëkalimit të ri nuk përputhet."
+                    feedback_type = "err"
+                else:
+                    cur.execute(
+                        "UPDATE admin_account SET password_hash = ?, updated_at = ? WHERE id = 1",
+                        (generate_password_hash(new_pwd), datetime.now().isoformat()),
+                    )
+                    conn.commit()
+                    cur.execute("SELECT * FROM admin_account WHERE id = 1")
+                    acc = cur.fetchone()
+                    feedback_msg = "Fjalëkalimi u ndryshua dhe u ruajt automatikisht."
+                    feedback_type = "ok"
+
+            elif action == "update_service":
+                svc_id = request.form.get("svc_id", type=int)
+                s_cat = (request.form.get("s_cat") or "Thonj").strip()
+                s_name = (request.form.get("s_name") or "").strip()
+                try:
+                    s_dur = int(request.form.get("s_dur") or 60)
+                except Exception:
+                    s_dur = 60
+                try:
+                    s_price = float(request.form.get("s_price") or 0.0)
+                except Exception:
+                    s_price = 0.0
+                s_desc = (request.form.get("s_desc") or "").strip()
+                if svc_id and s_name:
                     cur.execute(
                         """
-                        UPDATE clients
-                        SET is_blocked = 0, reset_pending = 1, reset_token = ?, reset_sent_via = ?, updated_at = ?
+                        UPDATE services
+                        SET category = ?, name = ?, duration_min = ?, price = ?, description = ?
                         WHERE id = ?
                         """,
-                        (token, channel_label, datetime.now().isoformat(), client_id),
+                        (s_cat, s_name, max(15, s_dur), max(0.0, s_price), s_desc, svc_id),
                     )
                     conn.commit()
-                    send_push_to_client(
-                        cli["contact_value"],
-                        title="🔐 Reseto Passwordin — Grande Studio",
-                        body=f"Admini dërgoi kërkesën për password të ri te {channel_label}. Klikoni për ta vendosur.",
-                        url=f"/?reset_token={token}",
-                    )
-                    external_reset_link = ext_url
-                    external_reset_label = channel_label
-                    feedback_msg = f"Njoftimi për resetimin e passwordit u dërgua te {channel_label}."
+                    feedback_msg = f"Shërbimi '{s_name}' u ruajt automatikisht."
                     feedback_type = "ok"
 
-        elif action == "mark_seen":
-            appt_id = request.form.get("appt_id", type=int)
-            if appt_id:
-                cur.execute("UPDATE appointments SET is_new = 0 WHERE id = ?", (appt_id,))
-                conn.commit()
-                feedback_msg = "Njoftimi u hoq."
-                feedback_type = "ok"
+            elif action == "add_service":
+                s_cat = (request.form.get("s_cat") or "Thonj").strip()
+                s_name = (request.form.get("s_name") or "").strip()
+                try:
+                    s_dur = int(request.form.get("s_dur") or 60)
+                except Exception:
+                    s_dur = 60
+                try:
+                    s_price = float(request.form.get("s_price") or 0.0)
+                except Exception:
+                    s_price = 0.0
+                s_desc = (request.form.get("s_desc") or "").strip()
+                if s_name:
+                    cur.execute(
+                        "INSERT INTO services (category, name, duration_min, price, description) VALUES (?, ?, ?, ?, ?)",
+                        (s_cat, s_name, max(15, s_dur), max(0.0, s_price), s_desc),
+                    )
+                    conn.commit()
+                    feedback_msg = f"Shërbimi i ri '{s_name}' u shtua dhe u ruajt."
+                    feedback_type = "ok"
 
-        elif action == "mark_all_seen":
-            cur.execute("UPDATE appointments SET is_new = 0 WHERE is_new = 1")
-            conn.commit()
-            feedback_msg = "Të gjitha njoftimet u hoqën."
-            feedback_type = "ok"
+            elif action == "delete_service":
+                svc_id = request.form.get("svc_id", type=int)
+                if svc_id:
+                    cur.execute("DELETE FROM services WHERE id = ?", (svc_id,))
+                    conn.commit()
+                    feedback_msg = "Shërbimi u hoq."
+                    feedback_type = "ok"
 
-        elif action == "change_password":
-            curr_pwd = request.form.get("current_password", "")
-            new_pwd = request.form.get("new_password", "")
-            conf_pwd = request.form.get("confirm_password", "")
-
-            if not check_password_hash(acc["password_hash"], curr_pwd):
-                feedback_msg = "Fjalëkalimi aktual është i pasaktë."
-                feedback_type = "err"
-            elif len(new_pwd) < 6:
-                feedback_msg = "Fjalëkalimi i ri duhet të ketë të paktën 6 karaktere."
-                feedback_type = "err"
-            elif new_pwd != conf_pwd:
-                feedback_msg = "Konfirmimi i fjalëkalimit të ri nuk përputhet."
-                feedback_type = "err"
-            else:
-                cur.execute(
-                    "UPDATE admin_account SET password_hash = ?, updated_at = ? WHERE id = 1",
-                    (generate_password_hash(new_pwd), datetime.now().isoformat()),
-                )
-                conn.commit()
-                acc = get_admin_account()
-                feedback_msg = "Fjalëkalimi u ndryshua dhe u ruajt automatikisht."
-                feedback_type = "ok"
-
-        elif action == "update_service":
-            svc_id = request.form.get("svc_id", type=int)
-            s_cat = request.form.get("s_cat", "Thonj").strip()
-            s_name = request.form.get("s_name", "").strip()
-            s_dur = request.form.get("s_dur", type=int) or 60
-            s_price = request.form.get("s_price", type=float) or 0.0
-            s_desc = request.form.get("s_desc", "").strip()
-            if svc_id and s_name:
+            elif action == "block_slot":
+                b_date = (request.form.get("block_date") or today_str).strip()
+                b_start = (request.form.get("block_start") or "09:00").strip()
+                b_end = (request.form.get("block_end") or "10:00").strip()
+                b_reason = (request.form.get("block_reason") or "Bllokuar nga Grande Studio").strip() or "Bllokuar"
+                cur.execute("SELECT id FROM services LIMIT 1")
+                first_svc = cur.fetchone()
+                svc_id = first_svc["id"] if first_svc else None
                 cur.execute(
                     """
-                    UPDATE services
-                    SET category = ?, name = ?, duration_min = ?, price = ?, description = ?
-                    WHERE id = ?
+                    INSERT INTO appointments
+                    (client_name, client_phone, client_contact, service_id, appt_date, start_time, end_time, notes, status, is_new, client_notified, created_at)
+                    VALUES (?, '-', '', ?, ?, ?, ?, ?, 'Bllokuar', 0, 1, ?)
                     """,
-                    (s_cat, s_name, s_dur, s_price, s_desc, svc_id),
+                    (b_reason, svc_id, b_date, b_start, b_end, "Orar i bllokuar", datetime.now().isoformat()),
                 )
                 conn.commit()
-                feedback_msg = f"Shërbimi '{s_name}' u ruajt automatikisht."
+                feedback_msg = "Orari u bllokua dhe u ruajt automatikisht."
                 feedback_type = "ok"
 
-        elif action == "add_service":
-            s_cat = request.form.get("s_cat", "Thonj").strip()
-            s_name = request.form.get("s_name", "").strip()
-            s_dur = request.form.get("s_dur", type=int) or 60
-            s_price = request.form.get("s_price", type=float) or 0.0
-            s_desc = request.form.get("s_desc", "").strip()
-            if s_name:
-                cur.execute(
-                    "INSERT INTO services (category, name, duration_min, price, description) VALUES (?, ?, ?, ?, ?)",
-                    (s_cat, s_name, s_dur, s_price, s_desc),
-                )
-                conn.commit()
-                feedback_msg = f"Shërbimi i ri '{s_name}' u shtua dhe u ruajt."
-                feedback_type = "ok"
+            elif action == "set_status":
+                appt_id = request.form.get("appt_id", type=int)
+                new_status = request.form.get("status", "Konfirmuar")
+                if appt_id and new_status in ("Konfirmuar", "Anuluar", "Bllokuar"):
+                    cur.execute(
+                        """
+                        SELECT a.*, s.name AS service_name
+                        FROM appointments a
+                        LEFT JOIN services s ON a.service_id = s.id
+                        WHERE a.id = ?
+                        """,
+                        (appt_id,),
+                    )
+                    appt_row = cur.fetchone()
+                    cur.execute(
+                        "UPDATE appointments SET status = ?, is_new = 0, client_notified = 0 WHERE id = ?",
+                        (new_status, appt_id),
+                    )
+                    conn.commit()
 
-        elif action == "delete_service":
-            svc_id = request.form.get("svc_id", type=int)
-            if svc_id:
-                cur.execute("DELETE FROM services WHERE id = ?", (svc_id,))
-                conn.commit()
-                feedback_msg = "Shërbimi u hoq."
-                feedback_type = "ok"
+                    if appt_row and new_status in ("Konfirmuar", "Anuluar"):
+                        svc_title = appt_row["service_name"] or "Trajtim"
+                        if new_status == "Konfirmuar":
+                            send_push_to_client(
+                                appt_row["client_contact"] or "",
+                                title="✅ Termini u Konfirmua — Grande Studio",
+                                body=f"Termini juaj për {svc_title} më {appt_row['appt_date']} në ora {appt_row['start_time']} u konfirmua!",
+                                url="/",
+                                appt_id=appt_id,
+                            )
+                        else:
+                            send_push_to_client(
+                                appt_row["client_contact"] or "",
+                                title="❌ Termini u Anulua — Grande Studio",
+                                body=f"Termini juaj për {svc_title} më {appt_row['appt_date']} në ora {appt_row['start_time']} u anulua.",
+                                url="/",
+                                appt_id=appt_id,
+                            )
 
-        elif action == "block_slot":
-            b_date = request.form.get("block_date", today_str)
-            b_start = request.form.get("block_start", "09:00")
-            b_end = request.form.get("block_end", "10:00")
-            b_reason = request.form.get("block_reason", "Bllokuar nga Grande Studio").strip() or "Bllokuar"
-            cur.execute("SELECT id FROM services LIMIT 1")
-            first_svc = cur.fetchone()
-            svc_id = first_svc["id"] if first_svc else None
-            cur.execute(
-                """
-                INSERT INTO appointments
-                (client_name, client_phone, client_contact, service_id, appt_date, start_time, end_time, notes, status, is_new, client_notified, created_at)
-                VALUES (?, '-', '', ?, ?, ?, ?, ?, 'Bllokuar', 0, 1, ?)
-                """,
-                (b_reason, svc_id, b_date, b_start, b_end, "Orar i bllokuar", datetime.now().isoformat()),
-            )
-            conn.commit()
-            feedback_msg = "Orari u bllokua dhe u ruajt automatikisht."
-            feedback_type = "ok"
+                    feedback_msg = f"Termini u {new_status.lower()} dhe klienti u njoftua!"
+                    feedback_type = "ok"
 
-        elif action == "set_status":
-            appt_id = request.form.get("appt_id", type=int)
-            new_status = request.form.get("status", "Konfirmuar")
-            if appt_id and new_status in ("Konfirmuar", "Anuluar", "Bllokuar"):
-                cur.execute(
-                    """
-                    SELECT a.*, s.name AS service_name
-                    FROM appointments a
-                    LEFT JOIN services s ON a.service_id = s.id
-                    WHERE a.id = ?
-                    """,
-                    (appt_id,),
-                )
-                appt_row = cur.fetchone()
-                cur.execute(
-                    "UPDATE appointments SET status = ?, is_new = 0, client_notified = 0 WHERE id = ?",
-                    (new_status, appt_id),
-                )
-                conn.commit()
+            elif action == "delete_appt":
+                appt_id = request.form.get("appt_id", type=int)
+                if appt_id:
+                    cur.execute("DELETE FROM appointments WHERE id = ?", (appt_id,))
+                    conn.commit()
+                    feedback_msg = "Termini u fshi."
+                    feedback_type = "ok"
 
-                if appt_row and new_status in ("Konfirmuar", "Anuluar"):
-                    svc_title = appt_row["service_name"] or "Trajtim"
-                    if new_status == "Konfirmuar":
-                        send_push_to_client(
-                            appt_row["client_contact"] or "",
-                            title="✅ Termini u Konfirmua — Grande Studio",
-                            body=f"Termini juaj për {svc_title} më {appt_row['appt_date']} në ora {appt_row['start_time']} u konfirmua!",
-                            url="/",
-                            appt_id=appt_id,
-                        )
-                    else:
-                        send_push_to_client(
-                            appt_row["client_contact"] or "",
-                            title="❌ Termini u Anulua — Grande Studio",
-                            body=f"Termini juaj për {svc_title} më {appt_row['appt_date']} në ora {appt_row['start_time']} u anulua.",
-                            url="/",
-                            appt_id=appt_id,
-                        )
+        cur.execute("SELECT * FROM clients ORDER BY id DESC")
+        registered_clients = cur.fetchall()
 
-                feedback_msg = f"Termini u {new_status.lower()} dhe klienti u njoftua!"
-                feedback_type = "ok"
+        cur.execute(
+            """
+            SELECT a.*, s.name AS service_name, s.category, s.price
+            FROM appointments a
+            LEFT JOIN services s ON a.service_id = s.id
+            WHERE a.is_new = 1 AND a.status IN ('Në Pritje', 'Konfirmuar')
+            ORDER BY a.id DESC
+            """
+        )
+        new_appts = cur.fetchall()
 
-        elif action == "delete_appt":
-            appt_id = request.form.get("appt_id", type=int)
-            if appt_id:
-                cur.execute("DELETE FROM appointments WHERE id = ?", (appt_id,))
-                conn.commit()
-                feedback_msg = "Termini u fshi."
-                feedback_type = "ok"
+        cur.execute(
+            """
+            SELECT a.*, s.name AS service_name, s.category, s.price
+            FROM appointments a
+            LEFT JOIN services s ON a.service_id = s.id
+            ORDER BY a.is_new DESC, a.appt_date ASC, a.start_time ASC
+            """
+        )
+        appts = cur.fetchall()
 
-    cur.execute("SELECT * FROM clients ORDER BY id DESC")
-    registered_clients = cur.fetchall()
-
-    cur.execute(
-        """
-        SELECT a.*, s.name AS service_name, s.category, s.price
-        FROM appointments a
-        LEFT JOIN services s ON a.service_id = s.id
-        WHERE a.is_new = 1 AND a.status IN ('Në Pritje', 'Konfirmuar')
-        ORDER BY a.id DESC
-        """
-    )
-    new_appts = cur.fetchall()
-
-    cur.execute(
-        """
-        SELECT a.*, s.name AS service_name, s.category, s.price
-        FROM appointments a
-        LEFT JOIN services s ON a.service_id = s.id
-        ORDER BY a.is_new DESC, a.appt_date ASC, a.start_time ASC
-        """
-    )
-    appts = cur.fetchall()
-
-    cur.execute("SELECT * FROM services ORDER BY id")
-    services = cur.fetchall()
-    conn.close()
+        cur.execute("SELECT * FROM services ORDER BY id")
+        services = cur.fetchall()
+    finally:
+        conn.close()
 
     registered_clients_html = ""
     if registered_clients:
@@ -3586,26 +3673,27 @@ def admin_panel():
             badge_channel = "📧 Email" if rc["contact_type"] == "email" else "📸 Instagram"
             blocked_badge = '<span class="badge-blocked" style="margin-left:5px;">I BLLOKUAR</span>' if is_blk else ""
             pending_badge = '<span class="badge-new-live" style="font-size:0.62rem; margin-left:5px;">Reset në pritje</span>' if rc["reset_pending"] == 1 else ""
-            phone_txt = f" • Tel: {rc['client_phone']}" if rc["client_phone"] else ""
-            name_txt = f" ({rc['full_name']})" if rc["full_name"] and rc["full_name"] != rc["contact_value"] else ""
+            phone_txt = f" • Tel: {esc(rc['client_phone'])}" if rc["client_phone"] else ""
+            name_txt = f" ({esc(rc['full_name'])})" if rc["full_name"] and rc["full_name"] != rc["contact_value"] else ""
 
             block_btn_label = "🔓 Çbllokoje" if is_blk else "🚫 Bllokoje"
             block_btn_cls = "btn-unblk" if is_blk else "btn-blk"
+            safe_confirm_contact = esc(rc["contact_value"]).replace("'", "\\'")
 
             registered_clients_html += f"""
             <div class="client-list-item {'blocked-client' if is_blk else ''}">
               <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
-                <b style="font-size:0.83rem; color:var(--vishnje-dark);">{rc['contact_value']}{name_txt}</b>
+                <b style="font-size:0.83rem; color:var(--vishnje-dark);">{esc(rc['contact_value'])}{name_txt}</b>
                 <span class="svc-tag">{badge_channel}</span>
               </div>
               <div style="font-size:0.71rem; color:var(--muted); margin-top:3px;">
-                Regjistruar: {rc['created_at'][:10]}{phone_txt} {blocked_badge} {pending_badge}
+                Regjistruar: {esc((rc['created_at'] or '')[:10])}{phone_txt} {blocked_badge} {pending_badge}
               </div>
               <div class="client-action-grid">
                 <form method="POST">
                   <input type="hidden" name="action" value="delete_client">
                   <input type="hidden" name="client_id" value="{rc['id']}">
-                  <button type="submit" class="btn-sm-3d btn-del" style="width:100%;" onclick="return confirm('A jeni të sigurt që doni ta fshini klientin {rc['contact_value']}?');">
+                  <button type="submit" class="btn-sm-3d btn-del" style="width:100%;" onclick="return confirm('A jeni të sigurt që doni ta fshini klientin {safe_confirm_contact}?');">
                     🗑️ Fshije
                   </button>
                 </form>
@@ -3635,9 +3723,9 @@ def admin_panel():
     if external_reset_link:
         ext_link_banner = f"""
         <div style="background:#fff0f4; border:1px solid #fda4af; border-radius:10px; padding:8px 10px; margin-bottom:10px; font-size:0.76rem;">
-          <b>Njoftimi u dërgua te: {external_reset_label}</b><br>
-          <a href="{external_reset_link}" target="_blank" rel="noopener noreferrer" style="color:#be123c; font-weight:800; text-decoration:underline;">
-            ↗ Hap {external_reset_label} për të dërguar / parë njoftimin
+          <b>Njoftimi u dërgua te: {esc(external_reset_label)}</b><br>
+          <a href="{esc(external_reset_link)}" target="_blank" rel="noopener noreferrer" style="color:#be123c; font-weight:800; text-decoration:underline;">
+            ↗ Hap {esc(external_reset_label)} për të dërguar / parë njoftimin
           </a>
         </div>
         """
@@ -3646,19 +3734,19 @@ def admin_panel():
     if new_appts:
         cards = ""
         for na in new_appts:
-            notes_line = f"<div style='font-size:0.76rem; color:#881337; margin-top:4px;'>📝 <i>{na['notes']}</i></div>" if na["notes"] else ""
+            notes_line = f"<div style='font-size:0.76rem; color:#881337; margin-top:4px;'>📝 <i>{esc(na['notes'])}</i></div>" if na["notes"] else ""
             cards += f"""
             <div class="new-booking-card" id="newBookingCard_{na['id']}">
               <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
                 <span class="badge-new-live">🔔 NJOFTIM I RI</span>
-                <span style="font-size:0.78rem; font-weight:800; color:#9f1239;">{na['appt_date']} • {na['start_time']} - {na['end_time']}</span>
+                <span style="font-size:0.78rem; font-weight:800; color:#9f1239;">{esc(na['appt_date'])} • {esc(na['start_time'])} - {esc(na['end_time'])}</span>
               </div>
-              <div style="font-size:0.95rem; font-weight:800; color:#4c0519;">{na['client_name']}</div>
+              <div style="font-size:0.95rem; font-weight:800; color:#4c0519;">{esc(na['client_name'])}</div>
               <div style="font-size:0.82rem; font-weight:700; color:#881337; margin-top:2px;">
-                📞 <a href="tel:{na['client_phone']}" style="color:#be123c; text-decoration:underline;">{na['client_phone']}</a>
+                📞 <a href="tel:{esc(na['client_phone'])}" style="color:#be123c; text-decoration:underline;">{esc(na['client_phone'])}</a>
               </div>
               <div style="font-size:0.8rem; color:#261217; margin-top:4px;">
-                💅 <b>[{na['category'] or '-'}] {na['service_name'] or '-'}</b> ({na['price'] or 0:.0f}€)
+                💅 <b>[{esc(na['category'] or '-')}] {esc(na['service_name'] or '-')}</b> ({float(na['price'] or 0):.0f}€)
               </div>
               {notes_line}
               <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px; margin-top:10px;">
@@ -3683,7 +3771,7 @@ def admin_panel():
             """
 
         new_bookings_section = f"""
-        <div class="card-3d" style="border: 2px solid #e11d48; background: #fff8f9;">
+        <div class="card-3d" style="border: 2px solid #e11d48; background: #fff8f9;" id="newBookingsCardSection">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
             <h2 style="margin:0; color:#be123c;">🚨 Njoftime të Reja ({len(new_appts)})</h2>
             <form method="POST">
@@ -3722,10 +3810,10 @@ def admin_panel():
 
         rows_html += f"""
         <tr class="{row_cls}">
-          <td>{new_tag}<b>{a["appt_date"]}</b><br>{a["start_time"]}-{a["end_time"]}</td>
-          <td><b>{a["client_name"]}</b><br><a href="tel:{a["client_phone"]}" style="color:#6e4e57; text-decoration:none;">{a["client_phone"]}</a></td>
-          <td><span class="svc-tag">{a["category"] or "-"}</span><br><b>{a["service_name"] or "-"}</b></td>
-          <td><span class="badge {badge_cls}">{a["status"]}</span></td>
+          <td>{new_tag}<b>{esc(a["appt_date"])}</b><br>{esc(a["start_time"])}-{esc(a["end_time"])}</td>
+          <td><b>{esc(a["client_name"])}</b><br><a href="tel:{esc(a["client_phone"])}" style="color:#6e4e57; text-decoration:none;">{esc(a["client_phone"])}</a></td>
+          <td><span class="svc-tag">{esc(a["category"] or "-")}</span><br><b>{esc(a["service_name"] or "-")}</b></td>
+          <td><span class="badge {badge_cls}">{esc(a["status"])}</span></td>
           <td>
             {confirm_btn}
             <form method="POST" style="display:inline;">
@@ -3766,15 +3854,15 @@ def admin_panel():
               </div>
               <div>
                 <label>Çmimi (€)</label>
-                <input type="number" name="s_price" value="{s['price']:.2f}" min="0" step="0.5" required>
+                <input type="number" name="s_price" value="{float(s['price'] or 0):.2f}" min="0" step="0.5" required>
               </div>
             </div>
             <label>Emri i Shërbimit</label>
-            <input type="text" name="s_name" value="{s['name']}" required>
+            <input type="text" name="s_name" value="{esc(s['name'])}" required>
             <label>Kohëzgjatja (minuta)</label>
-            <input type="number" name="s_dur" value="{s['duration_min']}" min="15" step="15" required>
+            <input type="number" name="s_dur" value="{int(s['duration_min'] or 60)}" min="15" step="15" required>
             <label>Përshkrimi</label>
-            <input type="text" name="s_desc" value="{s['description'] or ''}">
+            <input type="text" name="s_desc" value="{esc(s['description'] or '')}">
           </form>
           <form method="POST" style="margin-top:6px;">
             <input type="hidden" name="action" value="delete_service">
@@ -3789,12 +3877,13 @@ def admin_panel():
         cls = "alert-ok" if feedback_type == "ok" else "alert-err"
         alert_html = f"""
         <div class="alert {cls}">
-          <span>{feedback_msg}</span>
+          <span>{esc(feedback_msg)}</span>
           <button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button>
         </div>
         """
 
-    max_existing_id = max([a["id"] for a in appts], default=0)
+    max_new_id = max([a["id"] for a in new_appts], default=0)
+    new_count_init = len(new_appts)
     w_start = settings.get("work_start") or WORK_START
     w_end = settings.get("work_end") or WORK_END
     step_min = int(settings.get("slot_step_min") or SLOT_STEP_MIN)
@@ -3828,7 +3917,7 @@ def admin_panel():
         <div class="header-inner">
           <div>
             <h1 class="brand-title">GRANDE STUDIO</h1>
-            <p class="brand-sub">{acc['email']}</p>
+            <p class="brand-sub">{esc(acc['email'])}</p>
           </div>
           <div class="header-mid">
             {ig_nav_html}
@@ -3847,7 +3936,7 @@ def admin_panel():
         <div class="card-3d" style="padding:11px 12px; background:#fff9fb;">
           <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
             <div style="font-size:0.76rem; font-weight:700; color:var(--vishnje);">
-              🔔 Njoftimet &amp; zëri aktivë • <span id="autoSaveIndicator">Ruajtje automatike</span>
+              🔔 Njoftimet (<span id="adminNewBadgeCount">{new_count_init}</span>) • <span id="autoSaveIndicator">Ruajtje automatike</span>
             </div>
             <div style="display:flex; gap:6px; flex-wrap:wrap;">
               <button type="button" onclick="testBackgroundLockScreenPush()" class="btn-sm-3d btn-seen" style="margin:0;">
@@ -3865,17 +3954,17 @@ def admin_panel():
           <div class="row-2">
             <div>
               <label for="cfg_work_start">Hapja e Orarit</label>
-              <input type="time" id="cfg_work_start" class="salon-cfg-input" value="{w_start}">
+              <input type="time" id="cfg_work_start" class="salon-cfg-input" value="{esc(w_start)}">
             </div>
             <div>
               <label for="cfg_work_end">Mbyllja e Orarit</label>
-              <input type="time" id="cfg_work_end" class="salon-cfg-input" value="{w_end}">
+              <input type="time" id="cfg_work_end" class="salon-cfg-input" value="{esc(w_end)}">
             </div>
           </div>
           <label for="cfg_slot_step">Hapi i Orareve (minuta)</label>
           <input type="number" id="cfg_slot_step" class="salon-cfg-input" value="{step_min}" min="15" step="15">
           <label for="cfg_hygiene_note">Shënimi i Higjienës &amp; Sterilizimit</label>
-          <input type="text" id="cfg_hygiene_note" class="salon-cfg-input" value="{hygiene_note}">
+          <input type="text" id="cfg_hygiene_note" class="salon-cfg-input" value="{esc(hygiene_note)}">
         </div>
 
         {new_bookings_section}
@@ -3975,8 +4064,18 @@ def admin_panel():
       </div>
 
       <script>
-        let lastKnownMaxId = {max_existing_id};
+        let lastAlertedNewId = {max_new_id};
+        let lastKnownNewCount = {new_count_init};
         const saveIndicator = document.getElementById('autoSaveIndicator');
+        const adminBadgeCount = document.getElementById('adminNewBadgeCount');
+
+        function escapeText(str) {{
+          return String(str || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+        }}
 
         function openRegisteredClientsModal() {{
           const m = document.getElementById('registeredClientsModal');
@@ -4066,26 +4165,39 @@ def admin_panel():
             const res = await fetch('/api/admin/new-bookings');
             if (!res.ok) return;
             const data = await res.json();
-            if (data.bookings && data.bookings.length > 0) {{
-              const newest = data.bookings[0];
-              if (newest.id > lastKnownMaxId) {{
-                lastKnownMaxId = newest.id;
+            const bookings = Array.isArray(data.bookings) ? data.bookings : [];
+            if (adminBadgeCount) {{
+              adminBadgeCount.textContent = String(bookings.length);
+            }}
+
+            if (bookings.length > 0) {{
+              const newest = bookings[0];
+              const hasBrandNewBooking = newest.id > lastAlertedNewId || bookings.length > lastKnownNewCount;
+
+              if (hasBrandNewBooking) {{
+                lastAlertedNewId = Math.max(lastAlertedNewId, newest.id);
+                lastKnownNewCount = bookings.length;
                 playAutoAlertSound();
                 if (navigator.vibrate) navigator.vibrate([400, 150, 400, 150, 500]);
 
                 const toast = document.getElementById('liveToastBanner');
                 const toastBody = document.getElementById('liveToastBody');
                 const toastActions = document.getElementById('liveToastActions');
-                toastBody.innerHTML = `<b>${{newest.client_name}}</b> (${{newest.client_phone}})<br>💅 ${{newest.service_name}} — 📅 ${{newest.appt_date}} në <b>${{newest.start_time}}</b>`;
-                toastActions.innerHTML = `
-                  <button type="button" onclick="handleQuickApptAction(${{newest.id}}, 'Konfirmuar')" class="btn-3d btn-confirm-3d" style="width:100%;">✅ Konfirmo</button>
-                  <button type="button" onclick="handleQuickApptAction(${{newest.id}}, 'Anuluar')" class="btn-3d btn-cancel-3d" style="width:100%;">❌ Anulo</button>
-                `;
-                toast.style.display = 'block';
+                if (toast && toastBody && toastActions) {{
+                  toastBody.innerHTML = `<b>${{escapeText(newest.client_name)}}</b> (${{escapeText(newest.client_phone)}})
+                    <br>💅 ${{escapeText(newest.service_name || 'Trajtim')}} — 📅 ${{escapeText(newest.appt_date)}} në <b>${{escapeText(newest.start_time)}}</b>`;
+                  toastActions.innerHTML = `
+                    <button type="button" onclick="handleQuickApptAction(${{newest.id}}, 'Konfirmuar')" class="btn-3d btn-confirm-3d" style="width:100%;">✅ Konfirmo</button>
+                    <button type="button" onclick="handleQuickApptAction(${{newest.id}}, 'Anuluar')" class="btn-3d btn-cancel-3d" style="width:100%;">❌ Anulo</button>
+                  `;
+                  toast.style.display = 'block';
+                }}
               }}
+            }} else {{
+              lastKnownNewCount = 0;
             }}
           }} catch (e) {{}}
-        }}, 5000);
+        }}, 4000);
       </script>
     """
     return render_iphone_shell("Paneli i Adminit — Grande Studio", inner, role_tag="admin")
