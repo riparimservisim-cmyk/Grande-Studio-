@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import hmac
 import html
 import json
 import os
@@ -8,6 +10,8 @@ import smtplib
 import sqlite3
 import string
 import struct
+import subprocess
+import sys
 import tempfile
 import time
 import zlib
@@ -23,6 +27,27 @@ try:
 except ImportError:
     HAS_PIL = False
 
+
+def ensure_push_dependencies() -> bool:
+    """Kontrollon dhe nëse mungon, tenton të instalojë pywebpush + cryptography për Web Push në sfond."""
+    try:
+        import pywebpush  # noqa: F401
+        import py_vapid  # noqa: F401
+        from cryptography.hazmat.primitives import serialization  # noqa: F401
+        return True
+    except ImportError:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", "pywebpush", "py-vapid", "cryptography"],
+                timeout=120,
+            )
+            return True
+        except Exception as exc:
+            print(f"[WEBPUSH] Nuk u instaluan dot paketat automatikisht: {exc}")
+            return False
+
+
+_PUSH_READY = ensure_push_dependencies()
 try:
     from pywebpush import webpush, WebPushException
     from py_vapid import Vapid
@@ -123,6 +148,21 @@ app.permanent_session_lifetime = timedelta(days=3650)
 app.config["SESSION_REFRESH_EACH_REQUEST"] = True
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+
+def sign_auth_token(raw_token: str) -> str:
+    sig = hmac.new(app.secret_key.encode("utf-8"), raw_token.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{raw_token}.{sig}"
+
+
+def verify_signed_token(signed_val: str) -> str | None:
+    if not signed_val or "." not in signed_val:
+        return None
+    raw_token, sig = signed_val.rsplit(".", 1)
+    expected = hmac.new(app.secret_key.encode("utf-8"), raw_token.encode("utf-8"), hashlib.sha256).hexdigest()
+    if hmac.compare_digest(sig, expected):
+        return raw_token
+    return None
 
 
 def get_vapid_keys() -> dict:
@@ -402,6 +442,16 @@ def init_db():
         """)
 
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT UNIQUE NOT NULL,
+                role TEXT NOT NULL,
+                client_id INTEGER,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS salon_settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 work_start TEXT NOT NULL DEFAULT '09:00',
@@ -543,6 +593,136 @@ def init_db():
         conn.close()
 
 
+def issue_persistent_login(role: str, client_id: int | None = None) -> str:
+    """Krijon një token të qëndrueshëm në databazë që mban Adminin ose Klientin kyçur derisa të shtypet 'Dil'."""
+    init_db()
+    raw_token = secrets.token_urlsafe(32)
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO auth_sessions (token, role, client_id, created_at) VALUES (?, ?, ?, ?)",
+            (raw_token, role, client_id, datetime.now().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    signed = sign_auth_token(raw_token)
+    session.permanent = True
+    if role == "admin":
+        session["admin_logged_in"] = True
+        session["admin_persist_token"] = signed
+        g_pending_cookies["gs_admin_token"] = signed
+    elif role == "client" and client_id:
+        session["client_logged_in"] = True
+        session["client_id"] = client_id
+        session["client_persist_token"] = signed
+        g_pending_cookies["gs_client_token"] = signed
+    return signed
+
+
+def revoke_persistent_login(role: str) -> None:
+    """Fshin tokenin vetëm kur përdoruesi klikon butonin 'Dil'."""
+    candidates = []
+    if role == "admin":
+        for val in (session.get("admin_persist_token"), request.cookies.get("gs_admin_token"), request.headers.get("X-Admin-Token")):
+            raw = verify_signed_token(val or "")
+            if raw:
+                candidates.append(raw)
+        session.pop("admin_logged_in", None)
+        session.pop("admin_persist_token", None)
+        g_deleted_cookies.add("gs_admin_token")
+    elif role == "client":
+        for val in (session.get("client_persist_token"), request.cookies.get("gs_client_token"), request.headers.get("X-Client-Token")):
+            raw = verify_signed_token(val or "")
+            if raw:
+                candidates.append(raw)
+        g_deleted_cookies.add("gs_client_token")
+
+    if candidates:
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.executemany("DELETE FROM auth_sessions WHERE token = ? AND role = ?", [(t, role) for t in candidates])
+            conn.commit()
+        finally:
+            conn.close()
+
+
+from flask import g
+
+g_pending_cookies_map = {}
+
+
+@app.before_request
+def restore_persistent_sessions():
+    init_db()
+    g.set_cookies = {}
+    g.del_cookies = set()
+
+    # Rikthen sesionin e Adminit nga tokeni i qëndrueshëm nëse sesioni Flask u humb pas refresh
+    if not session.get("admin_logged_in"):
+        for src_val in (
+            session.get("admin_persist_token"),
+            request.cookies.get("gs_admin_token"),
+            request.headers.get("X-Admin-Token"),
+        ):
+            raw = verify_signed_token(src_val or "")
+            if raw:
+                conn = get_db()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT id FROM auth_sessions WHERE token = ? AND role = 'admin'", (raw,))
+                    row = cur.fetchone()
+                finally:
+                    conn.close()
+                if row:
+                    session.permanent = True
+                    session["admin_logged_in"] = True
+                    session["admin_persist_token"] = sign_auth_token(raw)
+                    break
+
+    # Rikthen sesionin e Klientit nga tokeni i qëndrueshëm nëse sesioni Flask u humb pas refresh
+    if not session.get("client_logged_in"):
+        for src_val in (
+            session.get("client_persist_token"),
+            request.cookies.get("gs_client_token"),
+            request.headers.get("X-Client-Token"),
+        ):
+            raw = verify_signed_token(src_val or "")
+            if raw:
+                conn = get_db()
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        SELECT s.client_id, c.contact_value, c.contact_type, c.full_name, c.client_phone, c.is_blocked
+                        FROM auth_sessions s
+                        JOIN clients c ON s.client_id = c.id
+                        WHERE s.token = ? AND s.role = 'client'
+                        """,
+                        (raw,),
+                    )
+                    c_row = cur.fetchone()
+                finally:
+                    conn.close()
+                if c_row and int(c_row["is_blocked"] or 0) == 0:
+                    session.permanent = True
+                    session["client_logged_in"] = True
+                    session["client_id"] = c_row["client_id"]
+                    session["client_contact"] = c_row["contact_value"]
+                    session["client_contact_type"] = c_row["contact_type"]
+                    session["client_name"] = c_row["full_name"] or c_row["contact_value"]
+                    session["client_phone"] = c_row["client_phone"] or ""
+                    session["client_persist_token"] = sign_auth_token(raw)
+                    break
+
+
+g_pending_cookies = {}
+g_deleted_cookies = set()
+
+
 def normalize_contact_identifier(raw_val: str) -> tuple[str, str]:
     """Kthen (contact_type, normalized_value) ku contact_type është 'email' ose 'instagram'."""
     val = (raw_val or "").strip()
@@ -612,7 +792,8 @@ def is_client_blocked_in_db(contact_val: str = "", client_id: int | None = None)
 
 
 def clear_client_session_keys() -> None:
-    for k in ("client_logged_in", "client_id", "client_contact", "client_contact_type", "client_name", "client_phone"):
+    revoke_persistent_login("client")
+    for k in ("client_logged_in", "client_id", "client_contact", "client_contact_type", "client_name", "client_phone", "client_persist_token"):
         session.pop(k, None)
 
 
@@ -645,19 +826,40 @@ def get_admin_account():
 
 
 def is_admin_authenticated() -> bool:
-    return bool(session.get("admin_logged_in"))
+    if session.get("admin_logged_in"):
+        return True
+    for src_val in (
+        session.get("admin_persist_token"),
+        request.cookies.get("gs_admin_token") if request else None,
+        request.headers.get("X-Admin-Token") if request else None,
+    ):
+        raw = verify_signed_token(src_val or "")
+        if raw:
+            conn = get_db()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM auth_sessions WHERE token = ? AND role = 'admin'", (raw,))
+                row = cur.fetchone()
+            finally:
+                conn.close()
+            if row:
+                session.permanent = True
+                session["admin_logged_in"] = True
+                session["admin_persist_token"] = sign_auth_token(raw)
+                return True
+    return False
 
 
 def get_vapid_subject() -> str:
     acc = get_admin_account()
     email_val = (acc["email"] if acc and acc["email"] else "").strip()
-    if "@" in email_val and "." in email_val:
+    if "@" in email_val and "." in email_val and not email_val.endswith(".local"):
         return f"mailto:{email_val}"
-    return "mailto:grande.studio.app@gmail.com"
+    return "mailto:grande.studio.notifications@gmail.com"
 
 
 def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> tuple[int, list[str]]:
-    """Dërgon Web Push Notifications me prioritet të lartë dhe kthen (sent_count, errors)."""
+    """Dërgon Web Push Notifications me prioritet të lartë për Lock Screen dhe kthen (sent_count, errors)."""
     if not HAS_WEBPUSH:
         return 0, ["Paketa pywebpush/cryptography nuk është e instaluar në server."]
     if not subs:
@@ -693,13 +895,13 @@ def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> tuple[int,
         except WebPushException as ex:
             err_txt = str(ex)
             print(f"[WEBPUSH] Gabim dërgimi: {err_txt}")
-            errors.append(err_txt[:120])
+            errors.append(err_txt[:140])
             if ex.response is not None and ex.response.status_code in (404, 410):
                 dead_ids.append(sub["id"])
         except Exception as e:
             err_txt = str(e)
             print(f"[WEBPUSH] Gabim i përgjithshëm: {err_txt}")
-            errors.append(err_txt[:120])
+            errors.append(err_txt[:140])
 
     if dead_ids:
         conn = get_db()
@@ -1668,6 +1870,8 @@ def render_iphone_shell(
     role_tag: str = "client",
     client_contact_tag: str = "",
     auto_redirect_admin_on_launch: bool = False,
+    admin_persist_token: str = "",
+    client_persist_token: str = "",
 ) -> str:
     now_clock = datetime.now().strftime("%H:%M")
     base_url = request.url_root.rstrip("/") if request else ""
@@ -1692,6 +1896,8 @@ def render_iphone_shell(
     safe_client_contact = (client_contact_tag or "").replace("'", "").replace("\\", "").strip().lower()
     safe_role_tag = (role_tag or "client").replace("'", "").replace("\\", "").strip()
     auto_redir_js = "true" if auto_redirect_admin_on_launch else "false"
+    safe_admin_tok = (admin_persist_token or "").replace("'", "").replace("\\", "").strip()
+    safe_client_tok = (client_persist_token or "").replace("'", "").replace("\\", "").strip()
 
     return f"""
     <!doctype html>
@@ -1744,6 +1950,25 @@ def render_iphone_shell(
         const PUSH_SUB_ROLE = '{push_role}';
         const PUSH_CLIENT_CONTACT = '{safe_client_contact}';
         const AUTO_REDIRECT_ADMIN = {auto_redir_js};
+        const SERVER_ADMIN_TOK = '{safe_admin_tok}';
+        const SERVER_CLIENT_TOK = '{safe_client_tok}';
+
+        try {{
+          if (SERVER_ADMIN_TOK) {{
+            localStorage.setItem('gs_admin_persist_token', SERVER_ADMIN_TOK);
+            document.cookie = 'gs_admin_token=' + encodeURIComponent(SERVER_ADMIN_TOK) + '; path=/; max-age=315360000; SameSite=Lax';
+          }} else if (role_tag === 'admin_login' || role_tag === 'reset') {{
+            const savedAdminTok = localStorage.getItem('gs_admin_persist_token');
+            if (savedAdminTok && !document.cookie.includes('gs_admin_token=')) {{
+              document.cookie = 'gs_admin_token=' + encodeURIComponent(savedAdminTok) + '; path=/; max-age=315360000; SameSite=Lax';
+              window.location.reload();
+            }}
+          }}
+          if (SERVER_CLIENT_TOK) {{
+            localStorage.setItem('gs_client_persist_token', SERVER_CLIENT_TOK);
+            document.cookie = 'gs_client_token=' + encodeURIComponent(SERVER_CLIENT_TOK) + '; path=/; max-age=315360000; SameSite=Lax';
+          }}
+        }} catch (e) {{}}
 
         if (AUTO_REDIRECT_ADMIN && window.location.pathname === '/') {{
           window.location.replace('/admin');
@@ -1928,6 +2153,20 @@ def apply_security_headers(response):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    max_age_sec = 3650 * 24 * 3600
+    for cookie_name, cookie_val in list(g_pending_cookies.items()):
+        response.set_cookie(
+            cookie_name,
+            cookie_val,
+            max_age=max_age_sec,
+            httponly=True,
+            samesite="Lax",
+            path="/",
+        )
+        g_pending_cookies.pop(cookie_name, None)
+    for del_name in list(g_deleted_cookies):
+        response.delete_cookie(del_name, path="/")
+        g_deleted_cookies.discard(del_name)
     return response
 
 
@@ -2004,7 +2243,7 @@ def manifest():
 @app.route("/sw.js")
 def service_worker():
     js = """
-    const CACHE_NAME = 'grande-studio-v11';
+    const CACHE_NAME = 'grande-studio-v12';
     const CORE_ASSETS = [
       '/manifest.json',
       '/static/icon-192.png',
@@ -2219,11 +2458,7 @@ def api_push_subscribe():
         return jsonify({"ok": False, "error": "Abonim i pavlefshëm"}), 400
 
     req_role = data.get("role")
-    if is_admin_authenticated() or req_role == "admin":
-        role = "admin" if (is_admin_authenticated() or req_role == "admin") else "client"
-    else:
-        role = "client"
-
+    role = "admin" if (is_admin_authenticated() or req_role == "admin") else "client"
     client_contact = (session.get("client_contact") or data.get("client_contact") or "").strip().lower()
 
     conn = get_db()
@@ -2547,13 +2782,13 @@ def index():
                             msg = "Admini ka aktivizuar rivendosjen e passwordit. Shënoni passwordin e ri."
                             msg_type = "ok"
                         elif check_password_hash(existing_client["password_hash"], raw_password):
-                            session.permanent = True
                             session["client_logged_in"] = True
                             session["client_id"] = existing_client["id"]
                             session["client_contact"] = existing_client["contact_value"]
                             session["client_contact_type"] = existing_client["contact_type"]
                             session["client_name"] = existing_client["full_name"] or existing_client["contact_value"]
                             session["client_phone"] = existing_client["client_phone"] or ""
+                            issue_persistent_login("client", int(existing_client["id"]))
                             msg = f"Mirësevini, {existing_client['contact_value']}! Tani mund të rezervoni terminin tuaj."
                             msg_type = "ok"
                         else:
@@ -2605,13 +2840,13 @@ def index():
                             )
                             new_client_id = cur.lastrowid
                             conn.commit()
-                            session.permanent = True
                             session["client_logged_in"] = True
                             session["client_id"] = new_client_id
                             session["client_contact"] = c_val
                             session["client_contact_type"] = c_type
                             session["client_name"] = full_name_in
                             session["client_phone"] = phone_in
+                            issue_persistent_login("client", int(new_client_id))
                             msg = f"Regjistrimi u krye me sukses për {full_name_in} ({c_val})! Tani mund të caktoni terminin tuaj."
                             msg_type = "ok"
                     active_tab = "book"
@@ -2646,13 +2881,13 @@ def index():
                         )
                         conn.commit()
                         pending_reset_client = None
-                        session.permanent = True
                         session["client_logged_in"] = True
                         session["client_id"] = target_cli["id"]
                         session["client_contact"] = target_cli["contact_value"]
                         session["client_contact_type"] = target_cli["contact_type"]
                         session["client_name"] = target_cli["full_name"] or target_cli["contact_value"]
                         session["client_phone"] = target_cli["client_phone"] or ""
+                        issue_persistent_login("client", int(target_cli["id"]))
                         msg = f"Passwordi i ri u ruajt dhe jeni kyçur automatikisht si {target_cli['contact_value']}!"
                         msg_type = "ok"
                     active_tab = "book"
@@ -3330,6 +3565,8 @@ def index():
         role_tag=role_tag,
         client_contact_tag=saved_client_contact,
         auto_redirect_admin_on_launch=is_admin_viewing,
+        admin_persist_token=session.get("admin_persist_token", ""),
+        client_persist_token=session.get("client_persist_token", ""),
     )
 
 
@@ -3370,8 +3607,7 @@ def admin_login():
                     conn.commit()
                 finally:
                     conn.close()
-                session.permanent = True
-                session["admin_logged_in"] = True
+                issue_persistent_login("admin")
                 return redirect(url_for("admin_panel"))
 
         alert_html = (
@@ -3429,8 +3665,7 @@ def admin_login():
             pwd_in = request.form.get("password", "")
             if email_in == (acc["email"] or "").strip().lower() and check_password_hash(acc["password_hash"], pwd_in):
                 clear_failed_login(client_ip)
-                session.permanent = True
-                session["admin_logged_in"] = True
+                issue_persistent_login("admin")
                 return redirect(url_for("admin_panel"))
             record_failed_login(client_ip)
             err = "Emaili ose fjalëkalimi është i pasaktë."
@@ -3506,7 +3741,7 @@ def admin_reset_password():
                 conn.commit()
             finally:
                 conn.close()
-            session.pop("admin_logged_in", None)
+            revoke_persistent_login("admin")
 
             sent, info_txt = send_reset_email(acc["email"], new_pwd)
             msg = info_txt
@@ -3555,7 +3790,7 @@ def admin_reset_password():
 
 @app.route("/admin/logout")
 def admin_logout():
-    session.pop("admin_logged_in", None)
+    revoke_persistent_login("admin")
     return redirect(url_for("admin_login"))
 
 
@@ -3565,7 +3800,7 @@ def admin_panel():
     init_db()
     acc = get_admin_account()
     if acc is None:
-        session.pop("admin_logged_in", None)
+        revoke_persistent_login("admin")
         return redirect(url_for("admin_login"))
 
     ig_nav_html = get_ig_nav_button_html()
@@ -4139,7 +4374,7 @@ def admin_panel():
           <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
             <div style="font-size:0.75rem; font-weight:700; color:var(--vishnje);">
               🔔 Të reja: <span id="adminNewBadgeCount">{new_count_init}</span> • {esc(push_lib_badge)} • Push: Admin({admin_push_subs}) / Klient({client_push_subs})<br>
-              <span style="color:var(--muted); font-size:0.69rem;" id="autoSaveIndicator">Ruajtje automatike aktive • Sesion i qëndrueshëm</span>
+              <span style="color:var(--muted); font-size:0.69rem;" id="autoSaveIndicator">Ruajtje automatike aktive • Sesion i përhershëm</span>
             </div>
             <div style="display:flex; gap:6px; flex-wrap:wrap;">
               <button type="button" onclick="testBackgroundLockScreenPush()" class="btn-sm-3d btn-seen" style="margin:0;">
@@ -4495,7 +4730,12 @@ def admin_panel():
         }}, 4000);
       </script>
     """
-    return render_iphone_shell("Paneli i Adminit — Grande Studio", inner, role_tag="admin")
+    return render_iphone_shell(
+        "Paneli i Adminit — Grande Studio",
+        inner,
+        role_tag="admin",
+        admin_persist_token=session.get("admin_persist_token", ""),
+    )
 
 
 if __name__ == "__main__":
