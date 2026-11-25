@@ -40,12 +40,6 @@ IG_USERNAME = "grande_studio3"
 IG_WEB_URL = f"https://www.instagram.com/{IG_USERNAME}/"
 IG_APP_URL = f"instagram://user?username={IG_USERNAME}"
 
-app = Flask(__name__, static_folder=STATIC_DIR)
-app.secret_key = os.environ.get("SECRET_KEY") or "grande_studio_persistent_secret_key_2026"
-app.permanent_session_lifetime = timedelta(days=3650)
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-
 # Orari i punës së sallonit (09:00 - 18:30, hap çdo 30 minuta)
 WORK_START = "09:00"
 WORK_END = "18:30"
@@ -100,7 +94,35 @@ def resolve_db_path() -> str:
 
 
 DB_PATH = resolve_db_path()
-VAPID_KEYS_PATH = os.path.join(os.path.dirname(DB_PATH), "vapid_keys.json")
+DATA_FOLDER = os.path.dirname(DB_PATH)
+VAPID_KEYS_PATH = os.path.join(DATA_FOLDER, "vapid_keys.json")
+SECRET_KEY_PATH = os.path.join(DATA_FOLDER, "flask_secret.key")
+
+
+def load_or_create_secret_key() -> str:
+    env_key = (os.environ.get("SECRET_KEY") or "").strip()
+    if env_key:
+        return env_key
+    try:
+        if os.path.exists(SECRET_KEY_PATH):
+            with open(SECRET_KEY_PATH, "r", encoding="utf-8") as f:
+                saved = f.read().strip()
+                if saved:
+                    return saved
+        generated = secrets.token_hex(32)
+        with open(SECRET_KEY_PATH, "w", encoding="utf-8") as f:
+            f.write(generated)
+        return generated
+    except Exception:
+        return "grande_studio_persistent_secret_key_2026"
+
+
+app = Flask(__name__, static_folder=STATIC_DIR)
+app.secret_key = load_or_create_secret_key()
+app.permanent_session_lifetime = timedelta(days=3650)
+app.config["SESSION_REFRESH_EACH_REQUEST"] = True
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 
 def get_vapid_keys() -> dict:
@@ -612,6 +634,20 @@ def get_salon_settings() -> dict:
         conn.close()
 
 
+def get_admin_account():
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM admin_account WHERE id = 1")
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def is_admin_authenticated() -> bool:
+    return bool(session.get("admin_logged_in"))
+
+
 def get_vapid_subject() -> str:
     acc = get_admin_account()
     email_val = (acc["email"] if acc and acc["email"] else "").strip()
@@ -620,18 +656,21 @@ def get_vapid_subject() -> str:
     return "mailto:grande.studio.app@gmail.com"
 
 
-def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> int:
-    """Dërgon Web Push Notifications me prioritet të lartë (Urgency: high, aes128gcm) dhe kthen numrin e dërguar."""
-    if not HAS_WEBPUSH or not subs:
-        return 0
+def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> tuple[int, list[str]]:
+    """Dërgon Web Push Notifications me prioritet të lartë dhe kthen (sent_count, errors)."""
+    if not HAS_WEBPUSH:
+        return 0, ["Paketa pywebpush/cryptography nuk është e instaluar në server."]
+    if not subs:
+        return 0, ["Nuk ka abonime Push të regjistruara në databazë."]
     vapid = get_vapid_keys()
     if not vapid.get("private_key"):
-        return 0
+        return 0, ["Çelësat VAPID nuk u gjeneruan."]
 
     payload = json.dumps(payload_dict, ensure_ascii=False)
     vapid_sub = get_vapid_subject()
     dead_ids = []
     sent_count = 0
+    errors = []
 
     for sub in subs:
         try:
@@ -652,11 +691,15 @@ def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> int:
             )
             sent_count += 1
         except WebPushException as ex:
-            print(f"[WEBPUSH] Gabim dërgimi: {ex}")
+            err_txt = str(ex)
+            print(f"[WEBPUSH] Gabim dërgimi: {err_txt}")
+            errors.append(err_txt[:120])
             if ex.response is not None and ex.response.status_code in (404, 410):
                 dead_ids.append(sub["id"])
         except Exception as e:
-            print(f"[WEBPUSH] Gabim i përgjithshëm: {e}")
+            err_txt = str(e)
+            print(f"[WEBPUSH] Gabim i përgjithshëm: {err_txt}")
+            errors.append(err_txt[:120])
 
     if dead_ids:
         conn = get_db()
@@ -667,14 +710,14 @@ def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> int:
         finally:
             conn.close()
 
-    return sent_count
+    return sent_count, errors
 
 
-def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int | None = None) -> int:
+def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int | None = None) -> tuple[int, list[str]]:
     conn = get_db()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'admin'")
+        cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'admin' ORDER BY id DESC")
         subs = cur.fetchall()
     finally:
         conn.close()
@@ -700,22 +743,22 @@ def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int
     )
 
 
-def send_push_to_client(client_contact: str, title: str, body: str, url: str = "/", appt_id: int | None = None) -> int:
+def send_push_to_client(client_contact: str, title: str, body: str, url: str = "/", appt_id: int | None = None) -> tuple[int, list[str]]:
     conn = get_db()
     try:
         cur = conn.cursor()
         clean_c = (client_contact or "").strip().lower()
         if clean_c:
             cur.execute(
-                "SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' AND LOWER(client_contact) = ?",
+                "SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' AND LOWER(client_contact) = ? ORDER BY id DESC",
                 (clean_c,),
             )
             subs = cur.fetchall()
             if not subs:
-                cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client'")
+                cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' ORDER BY id DESC")
                 subs = cur.fetchall()
         else:
-            cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client'")
+            cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' ORDER BY id DESC")
             subs = cur.fetchall()
     finally:
         conn.close()
@@ -732,16 +775,6 @@ def send_push_to_client(client_contact: str, title: str, body: str, url: str = "
             "timestamp": datetime.now().isoformat(),
         },
     )
-
-
-def get_admin_account():
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM admin_account WHERE id = 1")
-        return cur.fetchone()
-    finally:
-        conn.close()
 
 
 def generate_temp_password(length: int = 12) -> str:
@@ -777,8 +810,10 @@ def send_reset_email(to_email: str, new_password: str) -> tuple[bool, str]:
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if not session.get("admin_logged_in"):
+        if not is_admin_authenticated():
             return redirect(url_for("admin_login"))
+        session.permanent = True
+        session["admin_logged_in"] = True
         return f(*args, **kwargs)
     return decorated
 
@@ -1632,6 +1667,7 @@ def render_iphone_shell(
     description: str = "Grande Studio — Rezervime online për Thonj, Qerpikë dhe Vetulla. Zgjidhni trajtimin dhe orarin tuaj me një klikim.",
     role_tag: str = "client",
     client_contact_tag: str = "",
+    auto_redirect_admin_on_launch: bool = False,
 ) -> str:
     now_clock = datetime.now().strftime("%H:%M")
     base_url = request.url_root.rstrip("/") if request else ""
@@ -1655,6 +1691,7 @@ def render_iphone_shell(
     push_role = "admin" if role_tag == "admin" else "client"
     safe_client_contact = (client_contact_tag or "").replace("'", "").replace("\\", "").strip().lower()
     safe_role_tag = (role_tag or "client").replace("'", "").replace("\\", "").strip()
+    auto_redir_js = "true" if auto_redirect_admin_on_launch else "false"
 
     return f"""
     <!doctype html>
@@ -1706,6 +1743,11 @@ def render_iphone_shell(
         const CURRENT_ROLE = '{safe_role_tag}';
         const PUSH_SUB_ROLE = '{push_role}';
         const PUSH_CLIENT_CONTACT = '{safe_client_contact}';
+        const AUTO_REDIRECT_ADMIN = {auto_redir_js};
+
+        if (AUTO_REDIRECT_ADMIN && window.location.pathname === '/') {{
+          window.location.replace('/admin');
+        }}
 
         function unlockAudioContext() {{
           try {{
@@ -1802,7 +1844,7 @@ def render_iphone_shell(
               body: JSON.stringify(subJson)
             }});
             const saveData = await saveRes.json();
-            return {{ ok: Boolean(saveData && saveData.ok), reason: 'subscribed' }};
+            return {{ ok: Boolean(saveData && saveData.ok), reason: 'subscribed', role: saveData.role }};
           }} catch (e) {{
             return {{ ok: false, reason: String(e && e.message ? e.message : e) }};
           }}
@@ -1814,11 +1856,11 @@ def render_iphone_shell(
           const statusRes = await autoEnableNotificationsAndPush(contactVal, true);
           if (!statusRes.ok) {{
             if (statusRes.reason === 'denied') {{
-              alert('Njoftimet janë refuzuar në shfletues/telefon. Hapni Settings/Cilësimet -> Grande Studio -> Notifications dhe aktivizojini.');
+              alert('Njoftimet janë refuzuar në telefon/shfletues. Hapni Settings/Cilësimet -> Grande Studio -> Notifications dhe aktivizojini.');
             }} else if (statusRes.reason === 'no_vapid_server') {{
-              alert('Serveri nuk ka aktivizuar Web Push (mangon pywebpush/cryptography). Kontrolloni instalimin e paketave në server.');
+              alert('Serveri nuk ka aktivizuar Web Push (mangon pywebpush/cryptography). Instaloni në server: pip install pywebpush cryptography');
             }} else {{
-              alert('Ju lutem lejoni Njoftimet (Allow) dhe, nëse jeni në iPhone, sigurohuni që aplikacioni është i hapur nga ikona në Home Screen (Add to Home Screen).');
+              alert('Ju lutem lejoni Njoftimet (Allow). Në iPhone, hapni aplikacionin nga ikona në Home Screen.');
             }}
             return;
           }}
@@ -1829,10 +1871,11 @@ def render_iphone_shell(
             body: JSON.stringify({{ role: PUSH_SUB_ROLE, client_contact: contactVal }})
           }});
           const data = await res.json();
-          if (data.ok) {{
-            alert(`Njoftimi Push u dërgua (${{data.sent_count || 1}} pajisje të abonuar). Mbylleni aplikacionin ose kyçni ekranin (Lock Screen) për ta parë!`);
+          if (data.ok && Number(data.sent_count || 0) > 0) {{
+            alert(`Njoftimi Push u dërgua te ${{data.sent_count}} pajisje! Mbylleni aplikacionin ose kyçni ekranin (Lock Screen) për ta parë.`);
           }} else {{
-            alert(data.error || 'Nuk u gjet abonim aktiv për këtë pajisje.');
+            const errInfo = (data.errors && data.errors.length) ? ('\\nDetaj: ' + data.errors.join(' | ')) : '';
+            alert((data.error || 'Nuk u dërgua njoftim në sfond.') + errInfo);
           }}
         }}
 
@@ -1961,7 +2004,7 @@ def manifest():
 @app.route("/sw.js")
 def service_worker():
     js = """
-    const CACHE_NAME = 'grande-studio-v10';
+    const CACHE_NAME = 'grande-studio-v11';
     const CORE_ASSETS = [
       '/manifest.json',
       '/static/icon-192.png',
@@ -2024,36 +2067,46 @@ def service_worker():
             data = Object.assign(data, parsed);
           }
         } catch (e) {
-          try { data.body = event.data.text() || data.body; } catch (e2) {}
+          try {
+            const txt = event.data.text();
+            if (txt) data.body = txt;
+          } catch (e2) {}
         }
       }
 
-      const options = {
-        body: data.body,
-        icon: '/static/icon-192.png',
-        badge: '/static/icon-192.png',
-        vibrate: [400, 150, 400, 150, 500],
-        silent: false,
-        tag: data.tag || ('grande-studio-' + Date.now()),
-        renotify: true,
-        requireInteraction: true,
-        actions: Array.isArray(data.actions) ? data.actions : [],
-        data: {
-          url: data.url || '/',
-          appt_id: data.appt_id || null
-        }
-      };
-
-      event.waitUntil(
-        Promise.all([
-          self.registration.showNotification(data.title, options),
-          self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clientList => {
-            for (const client of clientList) {
-              client.postMessage({ type: 'GS_PUSH_RECEIVED', payload: data });
+      const showTask = (async () => {
+        try {
+          const baseOpts = {
+            body: data.body || 'Keni një njoftim të ri.',
+            icon: '/static/icon-192.png',
+            badge: '/static/icon-192.png',
+            tag: data.tag || ('grande-studio-' + Date.now()),
+            data: {
+              url: data.url || '/',
+              appt_id: data.appt_id || null
             }
-          })
-        ])
-      );
+          };
+          try {
+            await self.registration.showNotification(data.title || 'Grande Studio', Object.assign({}, baseOpts, {
+              vibrate: [400, 150, 400, 150, 500],
+              renotify: true,
+              requireInteraction: true,
+              actions: Array.isArray(data.actions) && data.actions.length ? data.actions : undefined
+            }));
+          } catch (innerErr) {
+            await self.registration.showNotification(data.title || 'Grande Studio', baseOpts);
+          }
+        } catch (outerErr) {}
+
+        try {
+          const clientList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+          for (const client of clientList) {
+            client.postMessage({ type: 'GS_PUSH_RECEIVED', payload: data });
+          }
+        } catch (cErr) {}
+      })();
+
+      event.waitUntil(showTask);
     });
 
     self.addEventListener('pushsubscriptionchange', event => {
@@ -2105,7 +2158,6 @@ def service_worker():
                 body: `Statusi i terminit #${apptId} u përditësua në: ${newStatus}.`,
                 icon: '/static/icon-192.png',
                 badge: '/static/icon-192.png',
-                vibrate: [200, 100, 200],
                 tag: 'grande-studio-action-feedback'
               }
             );
@@ -2142,6 +2194,24 @@ def api_push_public_key():
     return jsonify({"publicKey": keys.get("public_key", ""), "supported": bool(HAS_WEBPUSH and keys.get("public_key"))})
 
 
+@app.route("/api/push/status")
+def api_push_status():
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT role, COUNT(*) AS cnt FROM push_subscriptions GROUP BY role")
+        counts = {r["role"]: r["cnt"] for r in cur.fetchall()}
+    finally:
+        conn.close()
+    keys = get_vapid_keys()
+    return jsonify({
+        "has_pywebpush": HAS_WEBPUSH,
+        "has_vapid_keys": bool(keys.get("public_key") and keys.get("private_key")),
+        "admin_subs": counts.get("admin", 0),
+        "client_subs": counts.get("client", 0),
+    })
+
+
 @app.route("/api/push/subscribe", methods=["POST"])
 def api_push_subscribe():
     data = request.get_json(silent=True)
@@ -2149,10 +2219,10 @@ def api_push_subscribe():
         return jsonify({"ok": False, "error": "Abonim i pavlefshëm"}), 400
 
     req_role = data.get("role")
-    if req_role in ("admin", "client"):
-        role = req_role
+    if is_admin_authenticated() or req_role == "admin":
+        role = "admin" if (is_admin_authenticated() or req_role == "admin") else "client"
     else:
-        role = "admin" if session.get("admin_logged_in") else "client"
+        role = "client"
 
     client_contact = (session.get("client_contact") or data.get("client_contact") or "").strip().lower()
 
@@ -2180,22 +2250,22 @@ def api_push_subscribe():
 def api_push_test():
     """Dërgon një njoftim testues Push me zë, vibrim dhe banner në Lock Screen."""
     data = request.get_json(silent=True) or {}
-    role = data.get("role") or ("admin" if session.get("admin_logged_in") else "client")
+    role = data.get("role") or ("admin" if is_admin_authenticated() else "client")
     if role == "admin":
-        sent_count = send_push_to_admins(
+        sent_count, errors = send_push_to_admins(
             title="🔔 Test Njoftimi — Grande Studio",
-            body="Njoftimet në sfond dhe Lock Screen po funksionojnë me zë, vibrim dhe banner!",
+            body="Njoftimet kur aplikacioni është i mbyllur ose në Lock Screen po funksionojnë!",
             url="/admin",
         )
     else:
         contact = (session.get("client_contact") or data.get("client_contact") or "").strip().lower()
-        sent_count = send_push_to_client(
+        sent_count, errors = send_push_to_client(
             contact,
             title="🔔 Test Njoftimi — Grande Studio",
-            body="Do të njoftoheni në Lock Screen sapo termini juaj të konfirmohet ose anulohet!",
+            body="Do të njoftoheni edhe kur aplikacioni është i mbyllur ose në Lock Screen!",
             url="/",
         )
-    return jsonify({"ok": True, "sent_count": sent_count})
+    return jsonify({"ok": sent_count > 0, "sent_count": sent_count, "errors": errors})
 
 
 @app.route("/api/push/action", methods=["POST"])
@@ -2403,7 +2473,10 @@ def client_logout():
 @app.route("/", methods=["GET", "POST"])
 def index():
     init_db()
-    is_admin_viewing = bool(session.get("admin_logged_in"))
+    is_admin_viewing = is_admin_authenticated()
+
+    if is_admin_viewing and request.method == "GET" and request.args.get("stay_client") != "1":
+        return redirect(url_for("admin_panel"))
 
     if session.get("client_logged_in") and is_client_blocked_in_db(
         contact_val=session.get("client_contact", ""),
@@ -2790,7 +2863,7 @@ def index():
             </div>
           </div>
           <div style="font-size:0.7rem; color:var(--muted); margin-top:4px;">
-            Shtyp <b>🔔 Lock Screen</b> për të aktivizuar dhe testuar njoftimet kur ekrani është i kyçur.
+            Shtyp <b>🔔 Lock Screen</b> për të aktivizuar dhe testuar njoftimet kur aplikacioni është i mbyllur.
           </div>
         </div>
         """
@@ -3010,7 +3083,7 @@ def index():
                     1. Hap linkun e <b>Grande Studio</b> në <b>Safari</b>.<br>
                     2. Shtyp ikonën <b>Share</b> (katrori me shigjetë).<br>
                     3. Zgjidh <b>Add to Home Screen</b> dhe shtyp <b>Add</b>.<br>
-                    4. Hape nga Home Screen dhe shtyp <b>🔔 Lock Screen</b> për njoftime kur ekrani është i kyçur.
+                    4. Hape nga Home Screen dhe shtyp <b>🔔 Lock Screen</b> për njoftime kur aplikacioni është i mbyllur.
                   </div>
                 </div>
               </div>
@@ -3256,13 +3329,14 @@ def index():
         inner,
         role_tag=role_tag,
         client_contact_tag=saved_client_contact,
+        auto_redirect_admin_on_launch=is_admin_viewing,
     )
 
 
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     init_db()
-    if session.get("admin_logged_in"):
+    if is_admin_authenticated():
         return redirect(url_for("admin_panel"))
 
     acc = get_admin_account()
@@ -3296,7 +3370,6 @@ def admin_login():
                     conn.commit()
                 finally:
                     conn.close()
-                session.clear()
                 session.permanent = True
                 session["admin_logged_in"] = True
                 return redirect(url_for("admin_panel"))
@@ -3317,7 +3390,7 @@ def admin_login():
                 {ig_nav_html}
               </div>
               <div class="header-actions">
-                <a href="{url_for('index')}" class="btn-3d btn-ghost-3d">← Klienti</a>
+                <a href="{url_for('index', stay_client='1')}" class="btn-3d btn-ghost-3d">← Klienti</a>
               </div>
             </div>
           </header>
@@ -3356,7 +3429,6 @@ def admin_login():
             pwd_in = request.form.get("password", "")
             if email_in == (acc["email"] or "").strip().lower() and check_password_hash(acc["password_hash"], pwd_in):
                 clear_failed_login(client_ip)
-                session.clear()
                 session.permanent = True
                 session["admin_logged_in"] = True
                 return redirect(url_for("admin_panel"))
@@ -3380,7 +3452,7 @@ def admin_login():
             {ig_nav_html}
           </div>
           <div class="header-actions">
-            <a href="{url_for('index')}" class="btn-3d btn-ghost-3d">← Klienti</a>
+            <a href="{url_for('index', stay_client='1')}" class="btn-3d btn-ghost-3d">← Klienti</a>
             <a href="{url_for('admin_reset_password')}" class="btn-3d btn-ghost-3d">🔑 Reset password</a>
           </div>
         </div>
@@ -3456,7 +3528,7 @@ def admin_reset_password():
             {ig_nav_html}
           </div>
           <div class="header-actions">
-            <a href="{url_for('index')}" class="btn-3d btn-ghost-3d">← Klienti</a>
+            <a href="{url_for('index', stay_client='1')}" class="btn-3d btn-ghost-3d">← Klienti</a>
             <a href="{url_for('admin_login')}" class="btn-3d btn-ghost-3d">🔒 Admin</a>
           </div>
         </div>
@@ -3483,7 +3555,7 @@ def admin_reset_password():
 
 @app.route("/admin/logout")
 def admin_logout():
-    session.clear()
+    session.pop("admin_logged_in", None)
     return redirect(url_for("admin_login"))
 
 
@@ -3779,6 +3851,7 @@ def admin_panel():
     cancelled_blocked_count = sum(1 for a in appts if a["status"] in ("Anuluar", "Bllokuar"))
     admin_push_subs = push_counts.get("admin", 0)
     client_push_subs = push_counts.get("client", 0)
+    push_lib_badge = "Push OK" if HAS_WEBPUSH else "Mungon pywebpush!"
 
     def build_clients_list_html(client_rows):
         if not client_rows:
@@ -4051,7 +4124,8 @@ def admin_panel():
             {ig_nav_html}
           </div>
           <div class="header-actions">
-            <a href="{url_for('index')}" class="btn-3d btn-ghost-3d">← Klienti</a>
+            <a href="{url_for('admin_panel')}" class="btn-3d btn-ghost-3d">↻ Rifresko</a>
+            <a href="{url_for('index', stay_client='1')}" class="btn-3d btn-ghost-3d">← Klienti</a>
             <a href="{url_for('admin_reset_password')}" class="btn-3d btn-ghost-3d">🔑 Reset password</a>
             <a href="{url_for('admin_logout')}" class="btn-3d btn-ghost-3d">Dil</a>
           </div>
@@ -4064,8 +4138,8 @@ def admin_panel():
         <div class="card-3d" style="padding:11px 12px; background:#fff9fb;">
           <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
             <div style="font-size:0.75rem; font-weight:700; color:var(--vishnje);">
-              🔔 Të reja: <span id="adminNewBadgeCount">{new_count_init}</span> • Push: Admin({admin_push_subs}) / Klient({client_push_subs})<br>
-              <span style="color:var(--muted); font-size:0.69rem;" id="autoSaveIndicator">Ruajtje automatike aktive</span>
+              🔔 Të reja: <span id="adminNewBadgeCount">{new_count_init}</span> • {esc(push_lib_badge)} • Push: Admin({admin_push_subs}) / Klient({client_push_subs})<br>
+              <span style="color:var(--muted); font-size:0.69rem;" id="autoSaveIndicator">Ruajtje automatike aktive • Sesion i qëndrueshëm</span>
             </div>
             <div style="display:flex; gap:6px; flex-wrap:wrap;">
               <button type="button" onclick="testBackgroundLockScreenPush()" class="btn-sm-3d btn-seen" style="margin:0;">
