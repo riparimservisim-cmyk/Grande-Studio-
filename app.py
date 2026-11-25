@@ -354,6 +354,21 @@ def init_db():
         )
     """)
 
+    cur.execute("PRAGMA table_info(clients)")
+    client_cols = [row["name"] for row in cur.fetchall()]
+    if "full_name" not in client_cols:
+        cur.execute("ALTER TABLE clients ADD COLUMN full_name TEXT NOT NULL DEFAULT ''")
+    if "client_phone" not in client_cols:
+        cur.execute("ALTER TABLE clients ADD COLUMN client_phone TEXT DEFAULT ''")
+    if "reset_pending" not in client_cols:
+        cur.execute("ALTER TABLE clients ADD COLUMN reset_pending INTEGER DEFAULT 0")
+    if "reset_token" not in client_cols:
+        cur.execute("ALTER TABLE clients ADD COLUMN reset_token TEXT DEFAULT ''")
+    if "reset_sent_via" not in client_cols:
+        cur.execute("ALTER TABLE clients ADD COLUMN reset_sent_via TEXT DEFAULT ''")
+    if "updated_at" not in client_cols:
+        cur.execute("ALTER TABLE clients ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS services (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -453,6 +468,8 @@ def init_db():
 def normalize_contact_identifier(raw_val: str) -> tuple[str, str]:
     """Kthen (contact_type, normalized_value) ku contact_type është 'email' ose 'instagram'."""
     val = (raw_val or "").strip()
+    if not val:
+        return "instagram", ""
     if "@" in val and "." in val.split("@")[-1]:
         return "email", val.lower()
     ig_clean = val.lstrip("@").strip().lower()
@@ -1745,7 +1762,7 @@ def manifest():
 @app.route("/sw.js")
 def service_worker():
     js = """
-    const CACHE_NAME = 'grande-studio-v7';
+    const CACHE_NAME = 'grande-studio-v8';
     const CORE_ASSETS = [
       '/manifest.json',
       '/static/icon-192.png',
@@ -2136,9 +2153,14 @@ def index():
     init_db()
     is_admin_viewing = bool(session.get("admin_logged_in"))
 
-    prepare_clean_nails_asset()
-    prepare_ig_avatar_asset()
-    prepare_app_icons()
+    try:
+        prepare_clean_nails_asset()
+        prepare_ig_avatar_asset()
+        prepare_app_icons()
+        get_vapid_keys()
+    except Exception as e:
+        print(f"[ASSETS] Paralajmërim gjatë përgatitjes së aseteve: {e}")
+
     banner_art_html = get_banner_artwork_html()
     ig_nav_html = get_ig_nav_button_html()
     settings = get_salon_settings()
@@ -2171,23 +2193,24 @@ def index():
     if request.method == "POST":
         post_mode = request.form.get("post_mode", "booking")
 
-        if post_mode == "client_auth":
-            raw_contact = request.form.get("auth_contact", "").strip()
-            raw_password = request.form.get("auth_password", "")
-            full_name_in = request.form.get("auth_full_name", "").strip()
-            phone_in = request.form.get("auth_phone", "").strip()
-            c_type, c_val = normalize_contact_identifier(raw_contact)
+        try:
+            if post_mode == "client_login":
+                raw_contact = request.form.get("login_contact", "").strip()
+                raw_password = request.form.get("login_password", "")
+                _, c_val = normalize_contact_identifier(raw_contact)
 
-            if not c_val or len(raw_password) < 4:
-                msg = "Ju lutem shkruani Email-in ose Instagram-in dhe një password (të paktën 4 karaktere)."
-                msg_type = "err"
-            else:
-                cur.execute("SELECT * FROM clients WHERE contact_value = ?", (c_val,))
-                existing_client = cur.fetchone()
-                if existing_client:
-                    if existing_client["reset_pending"] == 1:
+                if not c_val or not raw_password:
+                    msg = "Ju lutem shkruani Email-in ose Instagram-in dhe passwordin tuaj."
+                    msg_type = "err"
+                else:
+                    cur.execute("SELECT * FROM clients WHERE LOWER(contact_value) = ?", (c_val.lower(),))
+                    existing_client = cur.fetchone()
+                    if not existing_client:
+                        msg = "Ky Email ose Instagram nuk është regjistruar ende. Përdorni panelin 'Regjistrohu si Klient i Ri'."
+                        msg_type = "err"
+                    elif existing_client["reset_pending"] == 1:
                         pending_reset_client = existing_client
-                        msg = "Admini ka dërguar rivendosje të passwordit. Ju lutem shënoni passwordin e ri."
+                        msg = "Admini ka aktivizuar rivendosjen e passwordit. Shënoni passwordin e ri."
                         msg_type = "ok"
                     elif check_password_hash(existing_client["password_hash"], raw_password):
                         session.permanent = True
@@ -2197,144 +2220,174 @@ def index():
                         session["client_contact_type"] = existing_client["contact_type"]
                         session["client_name"] = existing_client["full_name"] or existing_client["contact_value"]
                         session["client_phone"] = existing_client["client_phone"] or ""
-                        msg = f"Mirësevini, {existing_client['contact_value']}! Tani mund të caktoni terminin tuaj."
+                        msg = f"Mirësevini, {existing_client['contact_value']}! Tani mund të rezervoni terminin tuaj."
                         msg_type = "ok"
                     else:
                         msg = "Passwordi është i pasaktë. Nëse e keni harruar, kontaktoni adminin për 'Refresko Password'."
                         msg_type = "err"
+                active_tab = "book"
+
+            elif post_mode == "client_register":
+                full_name_in = request.form.get("reg_full_name", "").strip()
+                raw_contact = request.form.get("reg_contact", "").strip()
+                phone_in = request.form.get("reg_phone", "").strip()
+                raw_password = request.form.get("reg_password", "")
+                c_type, c_val = normalize_contact_identifier(raw_contact)
+
+                if not c_val:
+                    msg = "Ju lutem shkruani një Email ose Instagram të vlefshëm."
+                    msg_type = "err"
+                elif len(raw_password) < 4:
+                    msg = "Passwordi duhet të ketë të paktën 4 karaktere."
+                    msg_type = "err"
                 else:
-                    now_iso = datetime.now().isoformat()
-                    display_name = full_name_in or c_val
+                    cur.execute("SELECT id, contact_value FROM clients WHERE LOWER(contact_value) = ?", (c_val.lower(),))
+                    already = cur.fetchone()
+                    if already:
+                        msg = f"Llogaria {already['contact_value']} ekziston tashmë. Ju lutem kyçuni te paneli i Kyçjes."
+                        msg_type = "err"
+                    else:
+                        now_iso = datetime.now().isoformat()
+                        display_name = full_name_in or c_val
+                        cur.execute(
+                            """
+                            INSERT INTO clients (full_name, contact_type, contact_value, client_phone, password_hash, reset_pending, reset_token, reset_sent_via, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, 0, '', '', ?, ?)
+                            """,
+                            (display_name, c_type, c_val, phone_in, generate_password_hash(raw_password), now_iso, now_iso),
+                        )
+                        new_client_id = cur.lastrowid
+                        conn.commit()
+                        session.permanent = True
+                        session["client_logged_in"] = True
+                        session["client_id"] = new_client_id
+                        session["client_contact"] = c_val
+                        session["client_contact_type"] = c_type
+                        session["client_name"] = display_name
+                        session["client_phone"] = phone_in
+                        msg = f"Regjistrimi u krye me sukses për {c_val}! Tani mund të caktoni terminin tuaj."
+                        msg_type = "ok"
+                active_tab = "book"
+
+            elif post_mode == "client_set_new_password":
+                target_client_id = request.form.get("reset_client_id", type=int)
+                target_token = request.form.get("reset_token", "").strip()
+                new_pwd = request.form.get("new_client_password", "")
+                conf_pwd = request.form.get("confirm_client_password", "")
+
+                cur.execute("SELECT * FROM clients WHERE id = ? AND reset_pending = 1", (target_client_id,))
+                target_cli = cur.fetchone()
+                if not target_cli or (target_cli["reset_token"] and target_token != target_cli["reset_token"]):
+                    msg = "Kërkesa për ndërrimin e passwordit nuk është e vlefshme."
+                    msg_type = "err"
+                elif len(new_pwd) < 4:
+                    pending_reset_client = target_cli
+                    msg = "Passwordi i ri duhet të ketë të paktën 4 karaktere."
+                    msg_type = "err"
+                elif new_pwd != conf_pwd:
+                    pending_reset_client = target_cli
+                    msg = "Passwordet nuk përputhen. Shënoni sërish passwordin e ri."
+                    msg_type = "err"
+                else:
                     cur.execute(
                         """
-                        INSERT INTO clients (full_name, contact_type, contact_value, client_phone, password_hash, reset_pending, reset_token, reset_sent_via, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, 0, '', '', ?, ?)
+                        UPDATE clients
+                        SET password_hash = ?, reset_pending = 0, reset_token = '', updated_at = ?
+                        WHERE id = ?
                         """,
-                        (display_name, c_type, c_val, phone_in, generate_password_hash(raw_password), now_iso, now_iso),
+                        (generate_password_hash(new_pwd), datetime.now().isoformat(), target_cli["id"]),
                     )
-                    new_client_id = cur.lastrowid
                     conn.commit()
+                    pending_reset_client = None
                     session.permanent = True
                     session["client_logged_in"] = True
-                    session["client_id"] = new_client_id
-                    session["client_contact"] = c_val
-                    session["client_contact_type"] = c_type
-                    session["client_name"] = display_name
-                    session["client_phone"] = phone_in
-                    msg = f"Llogaria u regjistrua dhe u kyçët me {c_val}! Tani mund të caktoni terminin."
+                    session["client_id"] = target_cli["id"]
+                    session["client_contact"] = target_cli["contact_value"]
+                    session["client_contact_type"] = target_cli["contact_type"]
+                    session["client_name"] = target_cli["full_name"] or target_cli["contact_value"]
+                    session["client_phone"] = target_cli["client_phone"] or ""
+                    msg = f"Passwordi i ri u ruajt dhe jeni kyçur automatikisht si {target_cli['contact_value']}!"
                     msg_type = "ok"
-            active_tab = "book"
-
-        elif post_mode == "client_set_new_password":
-            target_client_id = request.form.get("reset_client_id", type=int)
-            target_token = request.form.get("reset_token", "").strip()
-            new_pwd = request.form.get("new_client_password", "")
-            conf_pwd = request.form.get("confirm_client_password", "")
-
-            cur.execute("SELECT * FROM clients WHERE id = ? AND reset_pending = 1", (target_client_id,))
-            target_cli = cur.fetchone()
-            if not target_cli or (target_cli["reset_token"] and target_token != target_cli["reset_token"]):
-                msg = "Kërkesa për ndërrimin e passwordit nuk është e vlefshme."
-                msg_type = "err"
-            elif len(new_pwd) < 4:
-                pending_reset_client = target_cli
-                msg = "Passwordi i ri duhet të ketë të paktën 4 karaktere."
-                msg_type = "err"
-            elif new_pwd != conf_pwd:
-                pending_reset_client = target_cli
-                msg = "Passwordet nuk përputhen. Shënoni sërish passwordin e ri."
-                msg_type = "err"
-            else:
-                cur.execute(
-                    """
-                    UPDATE clients
-                    SET password_hash = ?, reset_pending = 0, reset_token = '', updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (generate_password_hash(new_pwd), datetime.now().isoformat(), target_cli["id"]),
-                )
-                conn.commit()
-                pending_reset_client = None
-                session.permanent = True
-                session["client_logged_in"] = True
-                session["client_id"] = target_cli["id"]
-                session["client_contact"] = target_cli["contact_value"]
-                session["client_contact_type"] = target_cli["contact_type"]
-                session["client_name"] = target_cli["full_name"] or target_cli["contact_value"]
-                session["client_phone"] = target_cli["client_phone"] or ""
-                msg = f"Passwordi i ri u ruajt dhe jeni kyçur automatikisht si {target_cli['contact_value']}!"
-                msg_type = "ok"
-            active_tab = "book"
-
-        else:
-            # Kontrollo që klienti të jetë i regjistruar/kyçur (ose admini në pamjen e klientit)
-            if not (session.get("client_logged_in") or is_admin_viewing):
-                msg = "Për të rezervuar termin, duhet fillimisht të regjistroheni ose të kyçeni në llogarinë tuaj!"
-                msg_type = "err"
                 active_tab = "book"
+
             else:
-                raw_contact_book = (session.get("client_contact") or request.form.get("client_contact") or "").strip()
-                _, norm_contact_book = normalize_contact_identifier(raw_contact_book)
-                client_name = (request.form.get("client_name") or session.get("client_name") or norm_contact_book).strip()
-                client_phone = (request.form.get("client_phone") or session.get("client_phone") or "").strip()
-                service_id = request.form.get("service_id", type=int)
-                appt_date = request.form.get("appt_date", "").strip()
-                start_time = request.form.get("start_time", "").strip()
-                notes = request.form.get("notes", "").strip()
-
-                cur.execute("SELECT * FROM services WHERE id = ?", (service_id,))
-                svc = cur.fetchone()
-
-                if not (norm_contact_book or client_name) or not client_phone or not svc or not appt_date or not start_time:
-                    msg = "Ju lutem plotësoni të gjitha fushat e detyrueshme dhe zgjidhni një orar."
+                if not (session.get("client_logged_in") or is_admin_viewing):
+                    msg = "Për të rezervuar termin, duhet fillimisht të regjistroheni ose të kyçeni në llogarinë tuaj!"
                     msg_type = "err"
                     active_tab = "book"
                 else:
-                    valid_slots = get_available_slots(appt_date, svc["duration_min"])
-                    if start_time not in valid_slots:
-                        msg = "Ky orar nuk është më i lirë ose nuk mjafton për kohëzgjatjen e shërbimit."
+                    raw_contact_book = (session.get("client_contact") or request.form.get("client_contact") or "").strip()
+                    _, norm_contact_book = normalize_contact_identifier(raw_contact_book)
+                    client_name = (request.form.get("client_name") or session.get("client_name") or norm_contact_book).strip()
+                    client_phone = (request.form.get("client_phone") or session.get("client_phone") or "").strip()
+                    service_id = request.form.get("service_id", type=int)
+                    appt_date = request.form.get("appt_date", "").strip()
+                    start_time = request.form.get("start_time", "").strip()
+                    notes = request.form.get("notes", "").strip()
+
+                    cur.execute("SELECT * FROM services WHERE id = ?", (service_id,))
+                    svc = cur.fetchone()
+
+                    if not (norm_contact_book or client_name) or not client_phone or not svc or not appt_date or not start_time:
+                        msg = "Ju lutem plotësoni të gjitha fushat e detyrueshme dhe zgjidhni një orar."
                         msg_type = "err"
                         active_tab = "book"
                     else:
-                        end_time = min_to_time(time_to_min(start_time) + svc["duration_min"])
-                        display_client_label = f"{client_name} ({norm_contact_book})" if norm_contact_book and norm_contact_book not in client_name else client_name
-                        cur.execute(
-                            """
-                            INSERT INTO appointments
-                            (client_name, client_phone, client_contact, service_id, appt_date, start_time, end_time, notes, status, is_new, client_notified, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Në Pritje', 1, 1, ?)
-                            """,
-                            (
-                                display_client_label,
-                                client_phone,
-                                norm_contact_book,
-                                service_id,
-                                appt_date,
-                                start_time,
-                                end_time,
-                                notes,
-                                datetime.now().isoformat(),
-                            ),
-                        )
-                        new_appt_id = cur.lastrowid
-                        if session.get("client_id"):
+                        valid_slots = get_available_slots(appt_date, svc["duration_min"])
+                        if start_time not in valid_slots:
+                            msg = "Ky orar nuk është më i lirë ose nuk mjafton për kohëzgjatjen e shërbimit."
+                            msg_type = "err"
+                            active_tab = "book"
+                        else:
+                            end_time = min_to_time(time_to_min(start_time) + svc["duration_min"])
+                            display_client_label = f"{client_name} ({norm_contact_book})" if norm_contact_book and norm_contact_book not in client_name else client_name
                             cur.execute(
-                                "UPDATE clients SET full_name = ?, client_phone = ?, updated_at = ? WHERE id = ?",
-                                (client_name, client_phone, datetime.now().isoformat(), session["client_id"]),
+                                """
+                                INSERT INTO appointments
+                                (client_name, client_phone, client_contact, service_id, appt_date, start_time, end_time, notes, status, is_new, client_notified, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Në Pritje', 1, 1, ?)
+                                """,
+                                (
+                                    display_client_label,
+                                    client_phone,
+                                    norm_contact_book,
+                                    service_id,
+                                    appt_date,
+                                    start_time,
+                                    end_time,
+                                    notes,
+                                    datetime.now().isoformat(),
+                                ),
                             )
-                            session["client_phone"] = client_phone
-                        conn.commit()
+                            new_appt_id = cur.lastrowid
+                            if session.get("client_id"):
+                                cur.execute(
+                                    "UPDATE clients SET full_name = ?, client_phone = ?, updated_at = ? WHERE id = ?",
+                                    (client_name, client_phone, datetime.now().isoformat(), session["client_id"]),
+                                )
+                                session["client_phone"] = client_phone
+                            conn.commit()
 
-                        send_push_to_admins(
-                            title=f"🔔 Kërkesë për Termin: {display_client_label}",
-                            body=f"{svc['name']} • Data: {appt_date} në {start_time} • Tel: {client_phone}",
-                            url="/admin",
-                            appt_id=new_appt_id,
-                        )
+                            send_push_to_admins(
+                                title=f"🔔 Kërkesë për Termin: {display_client_label}",
+                                body=f"{svc['name']} • Data: {appt_date} në {start_time} • Tel: {client_phone}",
+                                url="/admin",
+                                appt_id=new_appt_id,
+                            )
 
-                        msg = f"Kërkesa për termin u dërgua për {display_client_label} më {appt_date} në ora {start_time} ({svc['name']}). Do të njoftoheni sapo admini ta konfirmojë!"
-                        msg_type = "ok"
-                        active_tab = "book"
+                            msg = f"Kërkesa për termin u dërgua për {display_client_label} më {appt_date} në ora {start_time} ({svc['name']}). Do të njoftoheni sapo admini ta konfirmojë!"
+                            msg_type = "ok"
+                            active_tab = "book"
+
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            msg = "Ky Email ose Instagram është i regjistruar tashmë."
+            msg_type = "err"
+        except Exception as exc:
+            conn.rollback()
+            print(f"[INDEX POST ERROR] {exc}")
+            msg = f"Ndodhi një gabim gjatë përpunimit të kërkesës: {exc}"
+            msg_type = "err"
 
     saved_client_contact = session.get("client_contact", "")
     saved_client_name = session.get("client_name", "")
@@ -2441,7 +2494,7 @@ def index():
         """
 
     if is_client_logged_in:
-        client_login_card = f"""
+        client_auth_panels_html = f"""
         <div class="card-3d" style="padding:10px 12px; background:#fff9fb;">
           <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
             <div style="font-size:0.78rem; color:var(--vishnje-dark);">
@@ -2458,35 +2511,51 @@ def index():
         </div>
         """
     else:
-        client_login_card = f"""
+        client_auth_panels_html = f"""
         <div class="card-3d" style="padding:13px; border: 1.5px solid var(--vishnje-bright);">
-          <h2>🔐 Kyçu ose Regjistrohu për të Caktuar Termin</h2>
-          <p style="margin:0 0 8px; font-size:0.77rem; color:var(--muted); line-height:1.4;">
-            Për të rezervuar termin te <b>Grande Studio</b>, fillimisht regjistrohuni ose kyçuni me <b>Email</b> ose <b>Instagram</b> dhe <b>Password</b>.
+          <h2>🔐 Kyçu (Klient i Regjistruar Më Herët)</h2>
+          <p style="margin:0 0 8px; font-size:0.76rem; color:var(--muted); line-height:1.35;">
+            Jeni regjistruar më herët? Kyçuni me <b>Email</b> ose <b>Instagram</b> dhe <b>Password</b>.
           </p>
           <form method="POST">
-            <input type="hidden" name="post_mode" value="client_auth">
+            <input type="hidden" name="post_mode" value="client_login">
             <input type="hidden" name="active_tab" value="book">
 
-            <label for="auth_contact">Email ose Instagram *</label>
-            <input type="text" name="auth_contact" id="auth_contact" placeholder="p.sh. sara@email.com ose @sara.beauty" required>
+            <label for="login_contact">Email ose Instagram *</label>
+            <input type="text" name="login_contact" id="login_contact" placeholder="p.sh. sara@email.com ose @sara.beauty" required>
 
-            <label for="auth_password">Password *</label>
-            <input type="password" name="auth_password" id="auth_password" placeholder="Të paktën 4 karaktere..." required>
-
-            <div class="row-2">
-              <div>
-                <label for="auth_full_name">Emri &amp; Mbiemri</label>
-                <input type="text" name="auth_full_name" id="auth_full_name" placeholder="p.sh. Sara Berisha">
-              </div>
-              <div>
-                <label for="auth_phone">Numri i Telefonit</label>
-                <input type="tel" name="auth_phone" id="auth_phone" placeholder="+383 44 ...">
-              </div>
-            </div>
+            <label for="login_password">Password *</label>
+            <input type="password" name="login_password" id="login_password" placeholder="Shkruani passwordin..." required>
 
             <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px; padding:10px 12px; font-size:0.86rem;">
-              ✨ Kyçu / Regjistrohu Tani
+              🔑 Kyçu
+            </button>
+          </form>
+        </div>
+
+        <div class="card-3d" style="padding:13px; border: 1.5px solid var(--border);">
+          <h2>✨ Regjistrohu si Klient i Ri</h2>
+          <p style="margin:0 0 8px; font-size:0.76rem; color:var(--muted); line-height:1.35;">
+            Krijo llogari të re te <b>Grande Studio</b> për të rezervuar terminin tuaj.
+          </p>
+          <form method="POST">
+            <input type="hidden" name="post_mode" value="client_register">
+            <input type="hidden" name="active_tab" value="book">
+
+            <label for="reg_full_name">Emri &amp; Mbiemri *</label>
+            <input type="text" name="reg_full_name" id="reg_full_name" placeholder="p.sh. Sara Berisha" required>
+
+            <label for="reg_contact">Email ose Instagram *</label>
+            <input type="text" name="reg_contact" id="reg_contact" placeholder="p.sh. sara@email.com ose @sara.beauty" required>
+
+            <label for="reg_phone">Numri i Telefonit *</label>
+            <input type="tel" name="reg_phone" id="reg_phone" placeholder="p.sh. +383 44 ..." required>
+
+            <label for="reg_password">Password *</label>
+            <input type="password" name="reg_password" id="reg_password" placeholder="Të paktën 4 karaktere..." required>
+
+            <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px; padding:10px 12px; font-size:0.86rem;">
+              📝 Regjistrohu
             </button>
           </form>
         </div>
@@ -2640,7 +2709,7 @@ def index():
         </div>
 
         <div id="tab-book" class="tab-panel {'active' if active_tab == 'book' else ''}">
-          {client_login_card}
+          {client_auth_panels_html}
           {client_appts_html}
           {booking_form_card_html}
         </div>
