@@ -1,3 +1,4 @@
+import base64
 import html
 import json
 import os
@@ -6,8 +7,10 @@ import secrets
 import smtplib
 import sqlite3
 import string
+import struct
 import tempfile
 import time
+import zlib
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from functools import wraps
@@ -23,6 +26,7 @@ except ImportError:
 try:
     from pywebpush import webpush, WebPushException
     from py_vapid import Vapid
+    from cryptography.hazmat.primitives import serialization
     HAS_WEBPUSH = True
 except ImportError:
     HAS_WEBPUSH = False
@@ -112,8 +116,6 @@ def get_vapid_keys() -> dict:
 
     if HAS_WEBPUSH:
         try:
-            import base64
-            from cryptography.hazmat.primitives import serialization
             vapid = Vapid()
             vapid.generate_keys()
             priv_pem = vapid.private_pem().decode("utf-8")
@@ -328,9 +330,6 @@ def prepare_app_icons() -> None:
         except Exception:
             pass
 
-    import zlib
-    import struct
-
     def make_solid_png(w: int, h: int, rgba: tuple[int, int, int, int]) -> bytes:
         raw_row = b"\x00" + bytes(rgba) * w
         raw_data = raw_row * h
@@ -350,14 +349,18 @@ def prepare_app_icons() -> None:
 def get_db():
     global DB_PATH
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=15)
+        conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 15000")
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
     except sqlite3.OperationalError:
         DB_PATH = resolve_db_path()
-        conn = sqlite3.connect(DB_PATH, timeout=15)
+        conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 15000")
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
@@ -609,25 +612,37 @@ def get_salon_settings() -> dict:
         conn.close()
 
 
-def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> None:
-    """Dërgon Web Push Notifications me prioritet të lartë (Urgency: high, aes128gcm)."""
+def get_vapid_subject() -> str:
+    acc = get_admin_account()
+    email_val = (acc["email"] if acc and acc["email"] else "").strip()
+    if "@" in email_val and "." in email_val:
+        return f"mailto:{email_val}"
+    return "mailto:grande.studio.app@gmail.com"
+
+
+def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> int:
+    """Dërgon Web Push Notifications me prioritet të lartë (Urgency: high, aes128gcm) dhe kthen numrin e dërguar."""
     if not HAS_WEBPUSH or not subs:
-        return
+        return 0
     vapid = get_vapid_keys()
     if not vapid.get("private_key"):
-        return
+        return 0
 
     payload = json.dumps(payload_dict, ensure_ascii=False)
+    vapid_sub = get_vapid_subject()
     dead_ids = []
+    sent_count = 0
 
     for sub in subs:
         try:
             sub_info = json.loads(sub["subscription_json"])
+            if not sub_info.get("endpoint") or not sub_info.get("keys"):
+                continue
             webpush(
                 subscription_info=sub_info,
                 data=payload,
                 vapid_private_key=vapid["private_key"],
-                vapid_claims={"sub": "mailto:admin@grandestudio.local"},
+                vapid_claims={"sub": vapid_sub},
                 ttl=86400,
                 content_encoding="aes128gcm",
                 headers={
@@ -635,9 +650,10 @@ def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> None:
                     "Topic": str(payload_dict.get("tag", "grande-studio"))[:32],
                 },
             )
+            sent_count += 1
         except WebPushException as ex:
             print(f"[WEBPUSH] Gabim dërgimi: {ex}")
-            if ex.response and ex.response.status_code in (404, 410):
+            if ex.response is not None and ex.response.status_code in (404, 410):
                 dead_ids.append(sub["id"])
         except Exception as e:
             print(f"[WEBPUSH] Gabim i përgjithshëm: {e}")
@@ -651,8 +667,10 @@ def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> None:
         finally:
             conn.close()
 
+    return sent_count
 
-def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int | None = None) -> None:
+
+def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int | None = None) -> int:
     conn = get_db()
     try:
         cur = conn.cursor()
@@ -668,21 +686,21 @@ def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int
             {"action": "cancel_appt", "title": "❌ Anulo"},
         ]
 
-    dispatch_web_push(
+    return dispatch_web_push(
         subs,
         {
             "title": title,
             "body": body,
             "url": url,
             "appt_id": appt_id,
-            "tag": f"gs-admin-{appt_id or 'alert'}",
+            "tag": f"gs-admin-{appt_id or int(time.time())}",
             "actions": actions,
             "timestamp": datetime.now().isoformat(),
         },
     )
 
 
-def send_push_to_client(client_contact: str, title: str, body: str, url: str = "/", appt_id: int | None = None) -> None:
+def send_push_to_client(client_contact: str, title: str, body: str, url: str = "/", appt_id: int | None = None) -> int:
     conn = get_db()
     try:
         cur = conn.cursor()
@@ -694,7 +712,7 @@ def send_push_to_client(client_contact: str, title: str, body: str, url: str = "
             )
             subs = cur.fetchall()
             if not subs:
-                cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' AND client_contact = ''")
+                cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client'")
                 subs = cur.fetchall()
         else:
             cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client'")
@@ -702,14 +720,14 @@ def send_push_to_client(client_contact: str, title: str, body: str, url: str = "
     finally:
         conn.close()
 
-    dispatch_web_push(
+    return dispatch_web_push(
         subs,
         {
             "title": title,
             "body": body,
             "url": url,
             "appt_id": appt_id,
-            "tag": f"gs-client-{appt_id or 'alert'}",
+            "tag": f"gs-client-{appt_id or int(time.time())}",
             "actions": [],
             "timestamp": datetime.now().isoformat(),
         },
@@ -1304,6 +1322,34 @@ BASE_STYLE = """
     color: var(--vishnje);
   }
 
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  .stat-box {
+    background: #fff8fa;
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    padding: 7px 6px;
+    text-align: center;
+  }
+
+  .stat-num {
+    font-size: 0.95rem;
+    font-weight: 900;
+    color: var(--vishnje-dark);
+  }
+
+  .stat-lbl {
+    font-size: 0.64rem;
+    color: var(--muted);
+    font-weight: 700;
+    margin-top: 1px;
+  }
+
   .cat-filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .cat-chip-3d {
     background: linear-gradient(180deg, #fff, #f9eaee);
@@ -1491,13 +1537,13 @@ BASE_STYLE = """
     gap: 8px;
   }
 
-  table { width: 100%; border-collapse: collapse; font-size: 0.76rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.75rem; }
   th, td { padding: 7px 5px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
-  th { color: var(--vishnje); font-size: 0.7rem; text-transform: uppercase; }
+  th { color: var(--vishnje); font-size: 0.68rem; text-transform: uppercase; }
 
   .row-is-new { background-color: #fff1f2 !important; }
 
-  .badge { padding: 2px 7px; border-radius: 999px; font-size: 0.68rem; font-weight: 800; }
+  .badge { padding: 2px 7px; border-radius: 999px; font-size: 0.67rem; font-weight: 800; display: inline-block; }
   .b-ok { background: #d3f9d8; color: #1f7a3d; }
   .b-wait { background: #fff3bf; color: #9c6f00; }
   .b-blk { background: #ffe3e3; color: #b41e2d; }
@@ -1508,7 +1554,7 @@ BASE_STYLE = """
     border-radius: 8px;
     border: none;
     cursor: pointer;
-    font-size: 0.72rem;
+    font-size: 0.71rem;
     font-weight: 700;
     box-shadow: 0 2px 0 rgba(0,0,0,0.18);
     margin-bottom: 3px;
@@ -1705,53 +1751,86 @@ def render_iphone_shell(
           return outputArray;
         }}
 
+        function getActiveClientContact() {{
+          let c = (PUSH_CLIENT_CONTACT || '').trim().toLowerCase();
+          if (!c) {{
+            try {{ c = (localStorage.getItem('gs_client_contact') || '').trim().toLowerCase(); }} catch (e) {{}}
+          }}
+          return c;
+        }}
+
         async function autoEnableNotificationsAndPush(overrideContact, forcePrompt) {{
           try {{
-            if (!('Notification' in window)) return false;
-            if (Notification.permission === 'default' || forcePrompt) {{
+            if (!('Notification' in window)) return {{ ok: false, reason: 'no_notif_api' }};
+
+            if (Notification.permission === 'denied') {{
+              return {{ ok: false, reason: 'denied' }};
+            }}
+
+            if (Notification.permission !== 'granted') {{
+              if (!forcePrompt) return {{ ok: false, reason: 'needs_gesture' }};
               const perm = await Notification.requestPermission().catch(() => 'denied');
-              if (perm !== 'granted') return false;
+              if (perm !== 'granted') return {{ ok: false, reason: perm }};
             }}
-            if (Notification.permission === 'granted' && 'serviceWorker' in navigator && 'PushManager' in window) {{
-              const reg = await navigator.serviceWorker.ready;
-              const keyRes = await fetch('/api/push/public-key');
-              const keyData = await keyRes.json();
-              if (keyData.publicKey) {{
-                const existingSub = await reg.pushManager.getSubscription();
-                const sub = existingSub || await reg.pushManager.subscribe({{
-                  userVisibleOnly: true,
-                  applicationServerKey: urlBase64ToUint8Array(keyData.publicKey)
-                }});
-                const subJson = sub.toJSON ? sub.toJSON() : JSON.parse(JSON.stringify(sub));
-                subJson.role = PUSH_SUB_ROLE;
-                subJson.client_contact = (overrideContact || PUSH_CLIENT_CONTACT || localStorage.getItem('gs_client_contact') || '').toLowerCase();
-                await fetch('/api/push/subscribe', {{
-                  method: 'POST',
-                  headers: {{ 'Content-Type': 'application/json' }},
-                  body: JSON.stringify(subJson)
-                }}).catch(() => {{}});
-                return true;
-              }}
+
+            if (!('serviceWorker' in navigator) || !('PushManager' in window)) {{
+              return {{ ok: false, reason: 'no_push_manager' }};
             }}
-          }} catch (e) {{}}
-          return false;
+
+            const reg = await navigator.serviceWorker.ready;
+            const keyRes = await fetch('/api/push/public-key');
+            const keyData = await keyRes.json();
+            if (!keyData.publicKey || !keyData.supported) {{
+              return {{ ok: false, reason: 'no_vapid_server' }};
+            }}
+
+            let sub = await reg.pushManager.getSubscription();
+            if (!sub) {{
+              sub = await reg.pushManager.subscribe({{
+                userVisibleOnly: true,
+                applicationServerKey: urlBase64ToUint8Array(keyData.publicKey)
+              }});
+            }}
+
+            const subJson = sub.toJSON ? sub.toJSON() : JSON.parse(JSON.stringify(sub));
+            subJson.role = PUSH_SUB_ROLE;
+            subJson.client_contact = (overrideContact || getActiveClientContact() || '').toLowerCase();
+
+            const saveRes = await fetch('/api/push/subscribe', {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify(subJson)
+            }});
+            const saveData = await saveRes.json();
+            return {{ ok: Boolean(saveData && saveData.ok), reason: 'subscribed' }};
+          }} catch (e) {{
+            return {{ ok: false, reason: String(e && e.message ? e.message : e) }};
+          }}
         }}
 
         async function testBackgroundLockScreenPush() {{
           unlockAudioContext();
-          const ok = await autoEnableNotificationsAndPush('', true);
-          if (!ok) {{
-            alert('Ju lutem lejoni Njoftimet (Allow Notifications) në cilësimet e telefonit/shfletuesit dhe sigurohuni që aplikacioni është i instaluar në ekranin kryesor (Add to Home Screen).');
+          const contactVal = getActiveClientContact();
+          const statusRes = await autoEnableNotificationsAndPush(contactVal, true);
+          if (!statusRes.ok) {{
+            if (statusRes.reason === 'denied') {{
+              alert('Njoftimet janë refuzuar në shfletues/telefon. Hapni Settings/Cilësimet -> Grande Studio -> Notifications dhe aktivizojini.');
+            }} else if (statusRes.reason === 'no_vapid_server') {{
+              alert('Serveri nuk ka aktivizuar Web Push (mangon pywebpush/cryptography). Kontrolloni instalimin e paketave në server.');
+            }} else {{
+              alert('Ju lutem lejoni Njoftimet (Allow) dhe, nëse jeni në iPhone, sigurohuni që aplikacioni është i hapur nga ikona në Home Screen (Add to Home Screen).');
+            }}
             return;
           }}
+
           const res = await fetch('/api/push/test', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{ role: PUSH_SUB_ROLE, client_contact: PUSH_CLIENT_CONTACT || localStorage.getItem('gs_client_contact') || '' }})
+            body: JSON.stringify({{ role: PUSH_SUB_ROLE, client_contact: contactVal }})
           }});
           const data = await res.json();
           if (data.ok) {{
-            alert('Njoftimi testues u dërgua! Mbylleni aplikacionin dhe kyçni ekranin (Lock Screen) për ta parë.');
+            alert(`Njoftimi Push u dërgua (${{data.sent_count || 1}} pajisje të abonuar). Mbylleni aplikacionin ose kyçni ekranin (Lock Screen) për ta parë!`);
           }} else {{
             alert(data.error || 'Nuk u gjet abonim aktiv për këtë pajisje.');
           }}
@@ -1761,7 +1840,7 @@ def render_iphone_shell(
           window.addEventListener('load', () => {{
             navigator.serviceWorker.register('/sw.js', {{ scope: '/' }}).then(reg => {{
               reg.update().catch(() => {{}});
-              autoEnableNotificationsAndPush();
+              autoEnableNotificationsAndPush(getActiveClientContact(), false);
             }}).catch(() => {{}});
           }});
 
@@ -1774,7 +1853,7 @@ def render_iphone_shell(
         }}
 
         window.addEventListener('DOMContentLoaded', () => {{
-          autoEnableNotificationsAndPush();
+          autoEnableNotificationsAndPush(getActiveClientContact(), false);
         }});
 
         function openInstagramProfile(ev) {{
@@ -1793,7 +1872,7 @@ def render_iphone_shell(
 
         document.addEventListener('pointerdown', function() {{
           unlockAudioContext();
-          autoEnableNotificationsAndPush();
+          autoEnableNotificationsAndPush(getActiveClientContact(), false);
         }}, {{ once: true }});
       </script>
     </body>
@@ -1882,7 +1961,7 @@ def manifest():
 @app.route("/sw.js")
 def service_worker():
     js = """
-    const CACHE_NAME = 'grande-studio-v9';
+    const CACHE_NAME = 'grande-studio-v10';
     const CORE_ASSETS = [
       '/manifest.json',
       '/static/icon-192.png',
@@ -1940,9 +2019,12 @@ def service_worker():
       };
       if (event.data) {
         try {
-          data = Object.assign(data, event.data.json());
+          const parsed = event.data.json();
+          if (parsed && typeof parsed === 'object') {
+            data = Object.assign(data, parsed);
+          }
         } catch (e) {
-          data.body = event.data.text();
+          try { data.body = event.data.text() || data.body; } catch (e2) {}
         }
       }
 
@@ -1952,7 +2034,7 @@ def service_worker():
         badge: '/static/icon-192.png',
         vibrate: [400, 150, 400, 150, 500],
         silent: false,
-        tag: data.tag || 'grande-studio-booking',
+        tag: data.tag || ('grande-studio-' + Date.now()),
         renotify: true,
         requireInteraction: true,
         actions: Array.isArray(data.actions) ? data.actions : [],
@@ -2057,7 +2139,7 @@ def service_worker():
 @app.route("/api/push/public-key")
 def api_push_public_key():
     keys = get_vapid_keys()
-    return jsonify({"publicKey": keys.get("public_key", ""), "supported": HAS_WEBPUSH})
+    return jsonify({"publicKey": keys.get("public_key", ""), "supported": bool(HAS_WEBPUSH and keys.get("public_key"))})
 
 
 @app.route("/api/push/subscribe", methods=["POST"])
@@ -2100,20 +2182,20 @@ def api_push_test():
     data = request.get_json(silent=True) or {}
     role = data.get("role") or ("admin" if session.get("admin_logged_in") else "client")
     if role == "admin":
-        send_push_to_admins(
+        sent_count = send_push_to_admins(
             title="🔔 Test Njoftimi — Grande Studio",
             body="Njoftimet në sfond dhe Lock Screen po funksionojnë me zë, vibrim dhe banner!",
             url="/admin",
         )
     else:
         contact = (session.get("client_contact") or data.get("client_contact") or "").strip().lower()
-        send_push_to_client(
+        sent_count = send_push_to_client(
             contact,
             title="🔔 Test Njoftimi — Grande Studio",
-            body="Do të njoftoheni në Lock Screen sapo termini juaj të konfirmohet!",
+            body="Do të njoftoheni në Lock Screen sapo termini juaj të konfirmohet ose anulohet!",
             url="/",
         )
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "sent_count": sent_count})
 
 
 @app.route("/api/push/action", methods=["POST"])
@@ -2234,9 +2316,31 @@ def api_admin_new_bookings():
             """
         )
         rows = [dict(r) for r in cur.fetchall()]
+        cur.execute("SELECT COUNT(*) AS cnt FROM clients")
+        clients_count = cur.fetchone()["cnt"]
     finally:
         conn.close()
-    return jsonify({"count": len(rows), "bookings": rows})
+    return jsonify({"count": len(rows), "bookings": rows, "clients_count": clients_count})
+
+
+@app.route("/api/admin/clients")
+@admin_required
+def api_admin_clients():
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, full_name, contact_type, contact_value, client_phone,
+                   is_blocked, reset_pending, reset_sent_via, created_at
+            FROM clients
+            ORDER BY id DESC
+            """
+        )
+        clients_rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    return jsonify({"count": len(clients_rows), "clients": clients_rows})
 
 
 @app.route("/api/admin/auto-save-settings", methods=["POST"])
@@ -2550,7 +2654,7 @@ def index():
 
                                     send_push_to_admins(
                                         title=f"🔔 Kërkesë për Termin: {display_client_label}",
-                                        body=f"{svc['name']} • Data: {appt_date} në {start_time} • Tel: {client_phone}",
+                                        body=f"{svc['name']} • {appt_date} ({start_time}-{end_time}) • Tel: {client_phone}",
                                         url="/admin",
                                         appt_id=new_appt_id,
                                     )
@@ -2681,12 +2785,12 @@ def index():
               <b>👤 Klienti i kyçur:</b> {esc(saved_client_contact)}
             </div>
             <div style="display:flex; gap:5px;">
-              <button type="button" onclick="testBackgroundLockScreenPush()" class="btn-sm-3d btn-seen" style="font-size:0.68rem;">🔔 Testo Njoftimin</button>
+              <button type="button" onclick="testBackgroundLockScreenPush()" class="btn-sm-3d btn-seen" style="font-size:0.68rem;">🔔 Lock Screen</button>
               <a href="{url_for('client_logout')}" class="btn-sm-3d btn-del" style="text-decoration:none; font-size:0.68rem;">Dil</a>
             </div>
           </div>
           <div style="font-size:0.7rem; color:var(--muted); margin-top:4px;">
-            Njoftimet në Lock Screen me zë, vibrim dhe banner janë aktive për statusin e terminit tuaj.
+            Shtyp <b>🔔 Lock Screen</b> për të aktivizuar dhe testuar njoftimet kur ekrani është i kyçur.
           </div>
         </div>
         """
@@ -2905,7 +3009,8 @@ def index():
                   <div class="svc-desc">
                     1. Hap linkun e <b>Grande Studio</b> në <b>Safari</b>.<br>
                     2. Shtyp ikonën <b>Share</b> (katrori me shigjetë).<br>
-                    3. Zgjidh <b>Add to Home Screen</b> dhe shtyp <b>Add</b>.
+                    3. Zgjidh <b>Add to Home Screen</b> dhe shtyp <b>Add</b>.<br>
+                    4. Hape nga Home Screen dhe shtyp <b>🔔 Lock Screen</b> për njoftime kur ekrani është i kyçur.
                   </div>
                 </div>
               </div>
@@ -3107,7 +3212,7 @@ def index():
 
         setInterval(async () => {{
           try {{
-            const c = (PUSH_CLIENT_CONTACT || localStorage.getItem('gs_client_contact') || '').trim();
+            const c = getActiveClientContact();
             if (!c) return;
             const res = await fetch(`/api/client/status-updates?contact=${{encodeURIComponent(c)}}`);
             if (!res.ok) return;
@@ -3143,7 +3248,7 @@ def index():
               banner.style.display = 'block';
             }}
           }} catch (e) {{}}
-        }}, 5000);
+        }}, 4000);
       </script>
     """
     return render_iphone_shell(
@@ -3626,7 +3731,7 @@ def admin_panel():
                                 appt_id=appt_id,
                             )
 
-                    feedback_msg = f"Termini u {new_status.lower()} dhe klienti u njoftua!"
+                    feedback_msg = f"Termini #{appt_id} u vendos '{new_status}' dhe u dërgua njoftimi te klienti."
                     feedback_type = "ok"
 
             elif action == "delete_appt":
@@ -3634,7 +3739,7 @@ def admin_panel():
                 if appt_id:
                     cur.execute("DELETE FROM appointments WHERE id = ?", (appt_id,))
                     conn.commit()
-                    feedback_msg = "Termini u fshi."
+                    feedback_msg = f"Termini #{appt_id} u fshi."
                     feedback_type = "ok"
 
         cur.execute("SELECT * FROM clients ORDER BY id DESC")
@@ -3642,7 +3747,7 @@ def admin_panel():
 
         cur.execute(
             """
-            SELECT a.*, s.name AS service_name, s.category, s.price
+            SELECT a.*, s.name AS service_name, s.category, s.price, s.duration_min
             FROM appointments a
             LEFT JOIN services s ON a.service_id = s.id
             WHERE a.is_new = 1 AND a.status IN ('Në Pritje', 'Konfirmuar')
@@ -3653,7 +3758,7 @@ def admin_panel():
 
         cur.execute(
             """
-            SELECT a.*, s.name AS service_name, s.category, s.price
+            SELECT a.*, s.name AS service_name, s.category, s.price, s.duration_min
             FROM appointments a
             LEFT JOIN services s ON a.service_id = s.id
             ORDER BY a.is_new DESC, a.appt_date ASC, a.start_time ASC
@@ -3663,31 +3768,44 @@ def admin_panel():
 
         cur.execute("SELECT * FROM services ORDER BY id")
         services = cur.fetchall()
+
+        cur.execute("SELECT role, COUNT(*) AS cnt FROM push_subscriptions GROUP BY role")
+        push_counts = {r["role"]: r["cnt"] for r in cur.fetchall()}
     finally:
         conn.close()
 
-    registered_clients_html = ""
-    if registered_clients:
-        for rc in registered_clients:
-            is_blk = rc["is_blocked"] == 1
+    pending_count = sum(1 for a in appts if a["status"] == "Në Pritje")
+    confirmed_count = sum(1 for a in appts if a["status"] == "Konfirmuar")
+    cancelled_blocked_count = sum(1 for a in appts if a["status"] in ("Anuluar", "Bllokuar"))
+    admin_push_subs = push_counts.get("admin", 0)
+    client_push_subs = push_counts.get("client", 0)
+
+    def build_clients_list_html(client_rows):
+        if not client_rows:
+            return '<p style="font-size:0.8rem; color:var(--muted);">Nuk ka ende klientë të regjistruar.</p>'
+        out = ""
+        for rc in client_rows:
+            is_blk = int(rc["is_blocked"] or 0) == 1
             badge_channel = "📧 Email" if rc["contact_type"] == "email" else "📸 Instagram"
-            blocked_badge = '<span class="badge-blocked" style="margin-left:5px;">I BLLOKUAR</span>' if is_blk else ""
-            pending_badge = '<span class="badge-new-live" style="font-size:0.62rem; margin-left:5px;">Reset në pritje</span>' if rc["reset_pending"] == 1 else ""
-            phone_txt = f" • Tel: {esc(rc['client_phone'])}" if rc["client_phone"] else ""
-            name_txt = f" ({esc(rc['full_name'])})" if rc["full_name"] and rc["full_name"] != rc["contact_value"] else ""
+            blocked_badge = '<span class="badge-blocked" style="margin-left:5px;">I BLLOKUAR</span>' if is_blk else '<span class="badge b-ok" style="margin-left:5px;">AKTIV</span>'
+            pending_badge = '<span class="badge-new-live" style="font-size:0.62rem; margin-left:5px;">Reset në pritje</span>' if int(rc["reset_pending"] or 0) == 1 else ""
+            phone_txt = f" • 📞 {esc(rc['client_phone'])}" if rc["client_phone"] else ""
+            name_txt = f" — {esc(rc['full_name'])}" if rc["full_name"] and rc["full_name"] != rc["contact_value"] else ""
+            reg_date = esc((rc["created_at"] or "")[:16].replace("T", " "))
+            safe_confirm_contact = esc(rc["contact_value"]).replace("'", "\\'")
 
             block_btn_label = "🔓 Çbllokoje" if is_blk else "🚫 Bllokoje"
             block_btn_cls = "btn-unblk" if is_blk else "btn-blk"
-            safe_confirm_contact = esc(rc["contact_value"]).replace("'", "\\'")
 
-            registered_clients_html += f"""
+            out += f"""
             <div class="client-list-item {'blocked-client' if is_blk else ''}">
               <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
-                <b style="font-size:0.83rem; color:var(--vishnje-dark);">{esc(rc['contact_value'])}{name_txt}</b>
+                <b style="font-size:0.83rem; color:var(--vishnje-dark);">#{rc['id']} • {esc(rc['contact_value'])}{name_txt}</b>
                 <span class="svc-tag">{badge_channel}</span>
               </div>
-              <div style="font-size:0.71rem; color:var(--muted); margin-top:3px;">
-                Regjistruar: {esc((rc['created_at'] or '')[:10])}{phone_txt} {blocked_badge} {pending_badge}
+              <div style="font-size:0.71rem; color:var(--muted); margin-top:4px; line-height:1.4;">
+                🕒 Regjistruar: <b>{reg_date}</b>{phone_txt}<br>
+                {blocked_badge} {pending_badge}
               </div>
               <div class="client-action-grid">
                 <form method="POST">
@@ -3716,8 +3834,9 @@ def admin_panel():
               </div>
             </div>
             """
-    else:
-        registered_clients_html = '<p style="font-size:0.8rem; color:var(--muted);">Nuk ka ende klientë të regjistruar.</p>'
+        return out
+
+    registered_clients_html = build_clients_list_html(registered_clients)
 
     ext_link_banner = ""
     if external_reset_link:
@@ -3735,18 +3854,21 @@ def admin_panel():
         cards = ""
         for na in new_appts:
             notes_line = f"<div style='font-size:0.76rem; color:#881337; margin-top:4px;'>📝 <i>{esc(na['notes'])}</i></div>" if na["notes"] else ""
+            contact_line = f"<div style='font-size:0.75rem; color:#4c0519; margin-top:2px;'>✉️ <b>{esc(na['client_contact'])}</b></div>" if na["client_contact"] else ""
+            dur_txt = f" • {int(na['duration_min'] or 0)} min" if na["duration_min"] else ""
             cards += f"""
             <div class="new-booking-card" id="newBookingCard_{na['id']}">
               <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                <span class="badge-new-live">🔔 NJOFTIM I RI</span>
-                <span style="font-size:0.78rem; font-weight:800; color:#9f1239;">{esc(na['appt_date'])} • {esc(na['start_time'])} - {esc(na['end_time'])}</span>
+                <span class="badge-new-live">🔔 NJOFTIM #{na['id']}</span>
+                <span style="font-size:0.76rem; font-weight:800; color:#9f1239;">{esc(na['appt_date'])} • {esc(na['start_time'])}-{esc(na['end_time'])}</span>
               </div>
-              <div style="font-size:0.95rem; font-weight:800; color:#4c0519;">{esc(na['client_name'])}</div>
-              <div style="font-size:0.82rem; font-weight:700; color:#881337; margin-top:2px;">
+              <div style="font-size:0.94rem; font-weight:800; color:#4c0519;">{esc(na['client_name'])}</div>
+              {contact_line}
+              <div style="font-size:0.81rem; font-weight:700; color:#881337; margin-top:2px;">
                 📞 <a href="tel:{esc(na['client_phone'])}" style="color:#be123c; text-decoration:underline;">{esc(na['client_phone'])}</a>
               </div>
               <div style="font-size:0.8rem; color:#261217; margin-top:4px;">
-                💅 <b>[{esc(na['category'] or '-')}] {esc(na['service_name'] or '-')}</b> ({float(na['price'] or 0):.0f}€)
+                💅 <b>[{esc(na['category'] or '-')}] {esc(na['service_name'] or '-')}</b> ({float(na['price'] or 0):.0f}€{dur_txt})
               </div>
               {notes_line}
               <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px; margin-top:10px;">
@@ -3808,11 +3930,14 @@ def admin_panel():
             </form>
             """
 
+        note_sub = f"<br><span style='color:#881337;font-size:0.68rem;'>📝 {esc(a['notes'])}</span>" if a["notes"] else ""
+        price_sub = f"<br><span style='color:#6e4e57;font-size:0.68rem;'>{float(a['price'] or 0):.0f}€ • {int(a['duration_min'] or 0)}m</span>" if a["service_name"] else ""
+
         rows_html += f"""
         <tr class="{row_cls}">
-          <td>{new_tag}<b>{esc(a["appt_date"])}</b><br>{esc(a["start_time"])}-{esc(a["end_time"])}</td>
-          <td><b>{esc(a["client_name"])}</b><br><a href="tel:{esc(a["client_phone"])}" style="color:#6e4e57; text-decoration:none;">{esc(a["client_phone"])}</a></td>
-          <td><span class="svc-tag">{esc(a["category"] or "-")}</span><br><b>{esc(a["service_name"] or "-")}</b></td>
+          <td>{new_tag}<b>#{a["id"]} • {esc(a["appt_date"])}</b><br>{esc(a["start_time"])}-{esc(a["end_time"])}</td>
+          <td><b>{esc(a["client_name"])}</b><br><a href="tel:{esc(a["client_phone"])}" style="color:#6e4e57; text-decoration:none;">📞 {esc(a["client_phone"])}</a>{note_sub}</td>
+          <td><span class="svc-tag">{esc(a["category"] or "-")}</span><br><b>{esc(a["service_name"] or "-")}</b>{price_sub}</td>
           <td><span class="badge {badge_cls}">{esc(a["status"])}</span></td>
           <td>
             {confirm_btn}
@@ -3884,6 +4009,7 @@ def admin_panel():
 
     max_new_id = max([a["id"] for a in new_appts], default=0)
     new_count_init = len(new_appts)
+    clients_count_init = len(registered_clients)
     w_start = settings.get("work_start") or WORK_START
     w_end = settings.get("work_end") or WORK_END
     step_min = int(settings.get("slot_step_min") or SLOT_STEP_MIN)
@@ -3893,14 +4019,16 @@ def admin_panel():
       <div id="registeredClientsModal" class="modal-overlay" style="display:{'flex' if show_clients_modal else 'none'};">
         <div class="modal-card">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-            <b style="color:#72091d; font-size:0.96rem;">👥 Klientët ({len(registered_clients)})</b>
+            <b style="color:#72091d; font-size:0.96rem;" id="modalClientsTitle">👥 Klientët (<span id="modalClientsCount">{clients_count_init}</span>)</b>
             <button type="button" onclick="closeRegisteredClientsModal()" style="background:none; border:none; font-size:1.1rem; font-weight:800; color:#72091d; cursor:pointer;">✕</button>
           </div>
           <p style="margin:0 0 10px; font-size:0.74rem; color:var(--muted);">
-            Përdorni <b>Fshije</b>, <b>Bllokoje / Çbllokoje</b> ose <b>Reseto Passwordin</b> për secilin klient.
+            Lista e plotë dhe e përditësuar e klientëve të regjistruar me veprimet <b>Fshije</b>, <b>Bllokoje / Çbllokoje</b> dhe <b>Reseto Passwordin</b>.
           </p>
           {ext_link_banner}
-          {registered_clients_html}
+          <div id="registeredClientsListContainer">
+            {registered_clients_html}
+          </div>
         </div>
       </div>
 
@@ -3935,16 +4063,32 @@ def admin_panel():
 
         <div class="card-3d" style="padding:11px 12px; background:#fff9fb;">
           <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
-            <div style="font-size:0.76rem; font-weight:700; color:var(--vishnje);">
-              🔔 Njoftimet (<span id="adminNewBadgeCount">{new_count_init}</span>) • <span id="autoSaveIndicator">Ruajtje automatike</span>
+            <div style="font-size:0.75rem; font-weight:700; color:var(--vishnje);">
+              🔔 Të reja: <span id="adminNewBadgeCount">{new_count_init}</span> • Push: Admin({admin_push_subs}) / Klient({client_push_subs})<br>
+              <span style="color:var(--muted); font-size:0.69rem;" id="autoSaveIndicator">Ruajtje automatike aktive</span>
             </div>
             <div style="display:flex; gap:6px; flex-wrap:wrap;">
               <button type="button" onclick="testBackgroundLockScreenPush()" class="btn-sm-3d btn-seen" style="margin:0;">
-                🔔 Testo Lock Screen
+                🔔 Aktivizo / Testo Lock Screen
               </button>
               <button type="button" onclick="openRegisteredClientsModal()" class="btn-3d btn-vishnje-3d" style="padding:7px 11px; font-size:0.76rem;">
-                👥 Klientët ({len(registered_clients)})
+                👥 Klientët (<span id="btnClientsCount">{clients_count_init}</span>)
               </button>
+            </div>
+          </div>
+
+          <div class="stats-grid">
+            <div class="stat-box">
+              <div class="stat-num">{pending_count}</div>
+              <div class="stat-lbl">Në Pritje</div>
+            </div>
+            <div class="stat-box">
+              <div class="stat-num">{confirmed_count}</div>
+              <div class="stat-lbl">Konfirmuar</div>
+            </div>
+            <div class="stat-box">
+              <div class="stat-num">{cancelled_blocked_count}</div>
+              <div class="stat-lbl">Anuluar / Bllokuar</div>
             </div>
           </div>
         </div>
@@ -3970,7 +4114,7 @@ def admin_panel():
         {new_bookings_section}
 
         <div class="card-3d">
-          <h2>Terminet &amp; Bllokimet</h2>
+          <h2>📅 Terminet &amp; Bllokimet ({len(appts)})</h2>
           <div style="overflow-x:auto;">
             <table>
               <thead>
@@ -4068,6 +4212,9 @@ def admin_panel():
         let lastKnownNewCount = {new_count_init};
         const saveIndicator = document.getElementById('autoSaveIndicator');
         const adminBadgeCount = document.getElementById('adminNewBadgeCount');
+        const btnClientsCount = document.getElementById('btnClientsCount');
+        const modalClientsCount = document.getElementById('modalClientsCount');
+        const clientsListContainer = document.getElementById('registeredClientsListContainer');
 
         function escapeText(str) {{
           return String(str || '')
@@ -4077,7 +4224,80 @@ def admin_panel():
             .replace(/"/g, '&quot;');
         }}
 
+        function renderClientsFromApi(clients) {{
+          if (!clientsListContainer) return;
+          if (!Array.isArray(clients) || clients.length === 0) {{
+            clientsListContainer.innerHTML = '<p style="font-size:0.8rem; color:var(--muted);">Nuk ka ende klientë të regjistruar.</p>';
+            return;
+          }}
+          clientsListContainer.innerHTML = clients.map(rc => {{
+            const isBlk = Number(rc.is_blocked || 0) === 1;
+            const badgeChannel = rc.contact_type === 'email' ? '📧 Email' : '📸 Instagram';
+            const statusBadge = isBlk
+              ? '<span class="badge-blocked" style="margin-left:5px;">I BLLOKUAR</span>'
+              : '<span class="badge b-ok" style="margin-left:5px;">AKTIV</span>';
+            const pendingBadge = Number(rc.reset_pending || 0) === 1
+              ? '<span class="badge-new-live" style="font-size:0.62rem; margin-left:5px;">Reset në pritje</span>'
+              : '';
+            const phoneTxt = rc.client_phone ? ` • 📞 ${{escapeText(rc.client_phone)}}` : '';
+            const nameTxt = (rc.full_name && rc.full_name !== rc.contact_value) ? ` — ${{escapeText(rc.full_name)}}` : '';
+            const regDate = escapeText((rc.created_at || '').slice(0, 16).replace('T', ' '));
+            const blockBtnLabel = isBlk ? '🔓 Çbllokoje' : '🚫 Bllokoje';
+            const blockBtnCls = isBlk ? 'btn-unblk' : 'btn-blk';
+            const safeContactJs = String(rc.contact_value || '').replace(/'/g, "\\\\'");
+
+            return `
+              <div class="client-list-item ${{isBlk ? 'blocked-client' : ''}}">
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
+                  <b style="font-size:0.83rem; color:var(--vishnje-dark);">#${{rc.id}} • ${{escapeText(rc.contact_value)}}${{nameTxt}}</b>
+                  <span class="svc-tag">${{badgeChannel}}</span>
+                </div>
+                <div style="font-size:0.71rem; color:var(--muted); margin-top:4px; line-height:1.4;">
+                  🕒 Regjistruar: <b>${{regDate}}</b>${{phoneTxt}}<br>
+                  ${{statusBadge}} ${{pendingBadge}}
+                </div>
+                <div class="client-action-grid">
+                  <form method="POST">
+                    <input type="hidden" name="action" value="delete_client">
+                    <input type="hidden" name="client_id" value="${{rc.id}}">
+                    <button type="submit" class="btn-sm-3d btn-del" style="width:100%;" onclick="return confirm('A jeni të sigurt që doni ta fshini klientin ${{safeContactJs}}?');">
+                      🗑️ Fshije
+                    </button>
+                  </form>
+                  <form method="POST">
+                    <input type="hidden" name="action" value="toggle_block_client">
+                    <input type="hidden" name="client_id" value="${{rc.id}}">
+                    <button type="submit" class="btn-sm-3d ${{blockBtnCls}}" style="width:100%;">
+                      ${{blockBtnLabel}}
+                    </button>
+                  </form>
+                  <form method="POST">
+                    <input type="hidden" name="action" value="refresh_client_password">
+                    <input type="hidden" name="client_id" value="${{rc.id}}">
+                    <button type="submit" class="btn-sm-3d btn-rst" style="width:100%;">
+                      🔑 Reseto Passwordin
+                    </button>
+                  </form>
+                </div>
+              </div>
+            `;
+          }}).join('');
+        }}
+
+        async function refreshClientsLive() {{
+          try {{
+            const res = await fetch('/api/admin/clients');
+            if (!res.ok) return;
+            const data = await res.json();
+            const cnt = Number(data.count || 0);
+            if (btnClientsCount) btnClientsCount.textContent = String(cnt);
+            if (modalClientsCount) modalClientsCount.textContent = String(cnt);
+            renderClientsFromApi(data.clients || []);
+          }} catch (e) {{}}
+        }}
+
         function openRegisteredClientsModal() {{
+          refreshClientsLive();
           const m = document.getElementById('registeredClientsModal');
           if (m) m.style.display = 'flex';
         }}
@@ -4162,6 +4382,7 @@ def admin_panel():
 
         setInterval(async () => {{
           try {{
+            await refreshClientsLive();
             const res = await fetch('/api/admin/new-bookings');
             if (!res.ok) return;
             const data = await res.json();
