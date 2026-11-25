@@ -1,19 +1,19 @@
 import json
 import os
 import random
-import re
+import secrets
 import smtplib
 import sqlite3
 import string
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from functools import wraps
 from flask import Flask, request, redirect, url_for, session, Response, jsonify, send_from_directory
 from werkzeug.security import generate_password_hash, check_password_hash
 
 try:
-    from PIL import Image, ImageFilter
+    from PIL import Image, ImageFilter, ImageDraw
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
@@ -26,9 +26,6 @@ except ImportError:
     HAS_WEBPUSH = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
-os.makedirs(DATA_DIR, exist_ok=True)
-
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 
@@ -37,17 +34,14 @@ IG_USERNAME = "grande_studio3"
 IG_WEB_URL = f"https://www.instagram.com/{IG_USERNAME}/"
 IG_APP_URL = f"instagram://user?username={IG_USERNAME}"
 
-MSG_ACCEPTED = "Se termini u pranua dhe u rezervua, jeni te mirseardhur."
-MSG_REJECTED = "Ju kerkojmë ndjes, Nuk mund të pranojme terminin e juaj, provoni një ditë tjetër."
-MSG_RESET_PWD = "Admini ka aktivizuar Reset Password për llogarinë tuaj. Ju lutem futni një password të ri."
-
 app = Flask(__name__, static_folder=STATIC_DIR)
 app.secret_key = os.environ.get("SECRET_KEY") or "grande_studio_persistent_secret_key_2026"
+app.permanent_session_lifetime = timedelta(days=3650)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
-DB_PATH = os.path.join(DATA_DIR, "grande_studio.db")
-VAPID_KEYS_PATH = os.path.join(DATA_DIR, "vapid_keys.json")
+DB_PATH = os.path.join(BASE_DIR, "grande_studio.db")
+VAPID_KEYS_PATH = os.path.join(BASE_DIR, "vapid_keys.json")
 
 # Orari i punës së sallonit (09:00 - 18:30, hap çdo 30 minuta)
 WORK_START = "09:00"
@@ -65,30 +59,6 @@ SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER or "noreply@grandestudio.local
 FAILED_LOGIN_TRACKER: dict[str, list[float]] = {}
 MAX_FAILED_ATTEMPTS = 5
 LOCK_WINDOW_SECONDS = 300
-
-
-def get_asset_version() -> str:
-    mtimes = [SCRIPT_MTIME]
-    for name in (
-        "ig_avatar_clean.png",
-        "ig_avatar_clean_2.png",
-        "ig_avatar_clean_3.png",
-        "ig_avatar_clean_4.png",
-        "icon-192.png",
-        "icon-512.png",
-        "icon-512.jpg",
-    ):
-        p = os.path.join(STATIC_DIR, name)
-        if os.path.exists(p):
-            mtimes.append(os.path.getmtime(p))
-    return str(int(max(mtimes)))
-
-
-def normalize_ig_handle(raw: str) -> str:
-    cleaned = (raw or "").strip()
-    cleaned = re.sub(r"^https?://(www\.)?instagram\.com/", "", cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.strip("/").lstrip("@").strip()
-    return f"@{cleaned}" if cleaned else ""
 
 
 def get_vapid_keys() -> dict:
@@ -144,11 +114,6 @@ def clear_failed_login(client_ip: str) -> None:
 
 
 def prepare_clean_nails_asset() -> str | None:
-    for preferred in ("thonjet_clean_3.png", "thonjet_clean_2.png", "thonjet_clean.png"):
-        p = os.path.join(STATIC_DIR, preferred)
-        if os.path.exists(p):
-            return f"/static/{preferred}"
-
     clean_path = os.path.join(STATIC_DIR, "thonjet_clean.png")
     candidates = [
         os.path.join(BASE_DIR, "thonjët.jpg"),
@@ -164,7 +129,13 @@ def prepare_clean_nails_asset() -> str | None:
 
     src_file = next((p for p in candidates if os.path.exists(p)), None)
     if not src_file:
+        if os.path.exists(clean_path):
+            return "/static/thonjet_clean.png"
         return None
+
+    latest_m = max(os.path.getmtime(src_file), SCRIPT_MTIME)
+    if os.path.exists(clean_path) and os.path.getmtime(clean_path) >= latest_m:
+        return "/static/thonjet_clean.png"
 
     if HAS_PIL:
         try:
@@ -218,97 +189,120 @@ def prepare_clean_nails_asset() -> str | None:
         except Exception:
             pass
 
-    return None
+    fallback_static = os.path.join(STATIC_DIR, "thonjet_source.jpg")
+    with open(src_file, "rb") as f_in, open(fallback_static, "wb") as f_out:
+        f_out.write(f_in.read())
+    return "/static/thonjet_source.jpg"
 
 
 def prepare_ig_avatar_asset() -> str | None:
-    for preferred in (
-        "ig_avatar_clean_4.png",
-        "ig_avatar_clean_3.png",
-        "ig_avatar_clean_2.png",
-        "ig_avatar_clean.png",
-        "icon-512.jpg",
-        "icon-192.png",
-    ):
-        p = os.path.join(STATIC_DIR, preferred)
-        if os.path.exists(p):
-            return f"/static/{preferred}"
-
+    clean_path = os.path.join(STATIC_DIR, "ig_avatar_clean.png")
     candidates = [
         os.path.join(BASE_DIR, "896023468_18110131619343947_7234878166828640368_n.jpg"),
         os.path.join(BASE_DIR, "ig_profile.jpg"),
         os.path.join(BASE_DIR, "ig_profile.png"),
         os.path.join(BASE_DIR, "instagram.jpg"),
         os.path.join(BASE_DIR, "instagram.png"),
+        os.path.join(STATIC_DIR, "896023468_18110131619343947_7234878166828640368_n.jpg"),
+        os.path.join(STATIC_DIR, "ig_profile.jpg"),
     ]
-    src_file = next((p for p in candidates if os.path.exists(p)), None)
-    clean_path = os.path.join(STATIC_DIR, "ig_avatar_clean.png")
 
-    if src_file and HAS_PIL:
+    src_file = next((p for p in candidates if os.path.exists(p)), None)
+    if not src_file:
+        if os.path.exists(clean_path):
+            return "/static/ig_avatar_clean.png"
+        return None
+
+    latest_m = max(os.path.getmtime(src_file), SCRIPT_MTIME)
+    if os.path.exists(clean_path) and os.path.getmtime(clean_path) >= latest_m:
+        return "/static/ig_avatar_clean.png"
+
+    if HAS_PIL:
         try:
             img = Image.open(src_file).convert("RGBA")
             w, h = img.size
             side = min(w, h)
             left = (w - side) // 2
             top = (h - side) // 2
-            square = img.crop((left, top, left + side, top + side)).resize((256, 256), Image.Resampling.LANCZOS)
-            square.save(clean_path, "PNG")
+            size = 200
+            square = img.crop((left, top, left + side, top + side)).resize((size, size), Image.Resampling.LANCZOS)
+
+            mask = Image.new("L", (size, size), 0)
+            draw = ImageDraw.Draw(mask)
+            draw.ellipse((2, 2, size - 2, size - 2), fill=255)
+
+            out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            out.paste(square, (0, 0), mask)
+            out.save(clean_path, "PNG")
             return "/static/ig_avatar_clean.png"
         except Exception:
             pass
 
-    return None
+    fallback_static = os.path.join(STATIC_DIR, "ig_avatar_source.jpg")
+    with open(src_file, "rb") as f_in, open(fallback_static, "wb") as f_out:
+        f_out.write(f_in.read())
+    return "/static/ig_avatar_source.jpg"
 
 
 def prepare_app_icons() -> None:
-    """
-    Siguron që icon-192.png dhe icon-512.png në static/ të përmbajnë pamjen e plotë
-    të logos GRANDE STUDIO.
-    """
+    """Gjeneron ikonat 192x192 dhe 512x512 për instalimin PWA në iPhone dhe Android."""
     icon_192 = os.path.join(STATIC_DIR, "icon-192.png")
     icon_512 = os.path.join(STATIC_DIR, "icon-512.png")
-    icon_512_jpg = os.path.join(STATIC_DIR, "icon-512.jpg")
-    ig_clean_4 = os.path.join(STATIC_DIR, "ig_avatar_clean_4.png")
-    ig_clean_3 = os.path.join(STATIC_DIR, "ig_avatar_clean_3.png")
-    ig_clean_2 = os.path.join(STATIC_DIR, "ig_avatar_clean_2.png")
-    ig_clean_1 = os.path.join(STATIC_DIR, "ig_avatar_clean.png")
-
-    logo_sources = [
-        icon_512_jpg,
-        ig_clean_4,
-        ig_clean_3,
-        ig_clean_2,
-        icon_192,
-        ig_clean_1,
-        os.path.join(BASE_DIR, "896023468_18110131619343947_7234878166828640368_n.jpg"),
-        os.path.join(BASE_DIR, "ig_profile.jpg"),
-        os.path.join(BASE_DIR, "ig_profile.png"),
-        os.path.join(STATIC_DIR, "ig_profile.jpg"),
-        os.path.join(STATIC_DIR, "ig_profile.png"),
-    ]
-    chosen_logo = next((p for p in logo_sources if os.path.exists(p)), None)
-
-    if not chosen_logo or not HAS_PIL:
+    if os.path.exists(icon_192) and os.path.exists(icon_512):
         return
 
-    try:
-        src = Image.open(chosen_logo).convert("RGB")
-        w, h = src.size
-        side = min(w, h)
-        left = (w - side) // 2
-        top = (h - side) // 2
-        square = src.crop((left, top, left + side, top + side))
+    if HAS_PIL:
+        try:
+            ig_clean = os.path.join(STATIC_DIR, "ig_avatar_clean.png")
+            nails_clean = os.path.join(STATIC_DIR, "thonjet_clean.png")
+            for size, out_path in [(192, icon_192), (512, icon_512)]:
+                img = Image.new("RGBA", (size, size), (114, 9, 29, 255))
+                draw = ImageDraw.Draw(img)
+                pad = int(size * 0.06)
+                draw.ellipse(
+                    (pad, pad, size - pad, size - pad),
+                    fill=(69, 3, 15, 255),
+                    outline=(242, 118, 224, 255),
+                    width=max(3, size // 64),
+                )
 
-        img_192 = square.resize((192, 192), Image.Resampling.LANCZOS)
-        img_512 = square.resize((512, 512), Image.Resampling.LANCZOS)
+                if os.path.exists(ig_clean):
+                    av = Image.open(ig_clean).convert("RGBA")
+                    av_size = int(size * 0.76)
+                    av = av.resize((av_size, av_size), Image.Resampling.LANCZOS)
+                    pos = (size - av_size) // 2
+                    img.paste(av, (pos, pos), av)
+                elif os.path.exists(nails_clean):
+                    nl = Image.open(nails_clean).convert("RGBA")
+                    nl.thumbnail((int(size * 0.82), int(size * 0.82)), Image.Resampling.LANCZOS)
+                    pos_x = (size - nl.width) // 2
+                    pos_y = (size - nl.height) // 2
+                    img.paste(nl, (pos_x, pos_y), nl)
+                else:
+                    cx, cy = size // 2, size // 2
+                    r = int(size * 0.18)
+                    draw.text((cx - r, cy - r // 2), "GS", fill=(255, 230, 240, 255))
 
-        if not os.path.exists(icon_192) or os.path.getmtime(icon_192) < os.path.getmtime(chosen_logo):
-            img_192.save(icon_192, "PNG", optimize=True)
+                img.save(out_path, "PNG")
+            return
+        except Exception:
+            pass
 
-        if not os.path.exists(icon_512) or os.path.getmtime(icon_512) < os.path.getmtime(chosen_logo):
-            img_512.save(icon_512, "PNG", optimize=True)
-    except Exception as e:
-        print(f"[ICON] Gabim gjatë përgatitjes së ikonave: {e}")
+    import zlib
+    import struct
+
+    def make_solid_png(w: int, h: int, rgba: tuple[int, int, int, int]) -> bytes:
+        raw_row = b"\x00" + bytes(rgba) * w
+        raw_data = raw_row * h
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            return struct.pack("!I", len(data)) + tag + data + struct.pack("!I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        ihdr = struct.pack("!IIBBBBB", w, h, 8, 6, 0, 0, 0)
+        return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw_data)) + chunk(b"IEND", b"")
+
+    for sz, pth in [(192, icon_192), (512, icon_512)]:
+        if not os.path.exists(pth):
+            with open(pth, "wb") as f:
+                f.write(make_solid_png(sz, sz, (114, 9, 29, 255)))
 
 
 def get_db():
@@ -332,27 +326,31 @@ def init_db():
     """)
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS client_accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            auth_method TEXT NOT NULL DEFAULT 'instagram',
-            instagram TEXT DEFAULT '',
-            email TEXT DEFAULT '',
-            phone TEXT NOT NULL,
-            password_hash TEXT NOT NULL,
-            is_blocked INTEGER DEFAULT 0,
-            password_reset_required INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS salon_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            work_start TEXT NOT NULL DEFAULT '09:00',
+            work_end TEXT NOT NULL DEFAULT '18:30',
+            slot_step_min INTEGER NOT NULL DEFAULT 30,
+            hygiene_note TEXT NOT NULL DEFAULT 'Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.',
+            updated_at TEXT NOT NULL
         )
     """)
 
-    cur.execute("PRAGMA table_info(client_accounts)")
-    c_cols = [row["name"] for row in cur.fetchall()]
-    if "auth_method" not in c_cols:
-        cur.execute("ALTER TABLE client_accounts ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'instagram'")
-    if "is_blocked" not in c_cols:
-        cur.execute("ALTER TABLE client_accounts ADD COLUMN is_blocked INTEGER DEFAULT 0")
-    if "password_reset_required" not in c_cols:
-        cur.execute("ALTER TABLE client_accounts ADD COLUMN password_reset_required INTEGER DEFAULT 0")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL DEFAULT '',
+            contact_type TEXT NOT NULL,
+            contact_value TEXT UNIQUE NOT NULL,
+            client_phone TEXT DEFAULT '',
+            password_hash TEXT NOT NULL,
+            reset_pending INTEGER DEFAULT 0,
+            reset_token TEXT DEFAULT '',
+            reset_sent_via TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS services (
@@ -368,11 +366,8 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS appointments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_id INTEGER,
             client_name TEXT NOT NULL,
             client_phone TEXT NOT NULL,
-            client_instagram TEXT DEFAULT '',
-            client_email TEXT DEFAULT '',
             service_id INTEGER,
             appt_date TEXT NOT NULL,
             start_time TEXT NOT NULL,
@@ -381,7 +376,6 @@ def init_db():
             status TEXT DEFAULT 'Konfirmuar',
             is_new INTEGER DEFAULT 1,
             created_at TEXT NOT NULL,
-            FOREIGN KEY (client_id) REFERENCES client_accounts (id) ON DELETE SET NULL,
             FOREIGN KEY (service_id) REFERENCES services (id) ON DELETE SET NULL
         )
     """)
@@ -390,12 +384,6 @@ def init_db():
     cols = [row["name"] for row in cur.fetchall()]
     if "is_new" not in cols:
         cur.execute("ALTER TABLE appointments ADD COLUMN is_new INTEGER DEFAULT 0")
-    if "client_id" not in cols:
-        cur.execute("ALTER TABLE appointments ADD COLUMN client_id INTEGER")
-    if "client_instagram" not in cols:
-        cur.execute("ALTER TABLE appointments ADD COLUMN client_instagram TEXT DEFAULT ''")
-    if "client_email" not in cols:
-        cur.execute("ALTER TABLE appointments ADD COLUMN client_email TEXT DEFAULT ''")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS push_subscriptions (
@@ -406,29 +394,21 @@ def init_db():
         )
     """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS client_push_subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_id INTEGER,
-            endpoint TEXT UNIQUE NOT NULL,
-            subscription_json TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (client_id) REFERENCES client_accounts (id) ON DELETE CASCADE
+    cur.execute("SELECT COUNT(*) AS cnt FROM salon_settings")
+    if cur.fetchone()["cnt"] == 0:
+        cur.execute(
+            """
+            INSERT INTO salon_settings (id, work_start, work_end, slot_step_min, hygiene_note, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?)
+            """,
+            (
+                WORK_START,
+                WORK_END,
+                SLOT_STEP_MIN,
+                "Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.",
+                datetime.now().isoformat(),
+            ),
         )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS client_notifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_id INTEGER,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL,
-            event_type TEXT DEFAULT 'info',
-            is_read INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (client_id) REFERENCES client_accounts (id) ON DELETE CASCADE
-        )
-    """)
 
     cur.execute("SELECT COUNT(*) AS cnt FROM services")
     if cur.fetchone()["cnt"] == 0:
@@ -453,23 +433,93 @@ def init_db():
     conn.close()
 
 
-def _deliver_push_payload(rows, table_name: str, title: str, body: str, url: str = "/", play_sound: bool = True) -> None:
-    if not HAS_WEBPUSH or not rows:
+def normalize_contact_identifier(raw_val: str) -> tuple[str, str]:
+    """Kthen (contact_type, normalized_value) ku contact_type është 'email' ose 'instagram'."""
+    val = (raw_val or "").strip()
+    if "@" in val and "." in val.split("@")[-1]:
+        return "email", val.lower()
+    ig_clean = val.lstrip("@").strip().lower()
+    return "instagram", f"@{ig_clean}" if ig_clean else ""
+
+
+def send_client_password_reset_notification(client_row: sqlite3.Row, reset_url: str) -> tuple[str, str]:
+    """
+    Dërgon njoftimin e rivendosjes së fjalëkalimit te klienti përmes kanalit të regjistruar (Email ose Instagram).
+    Kthen (channel_label, external_action_url).
+    """
+    c_type = client_row["contact_type"]
+    c_val = client_row["contact_value"]
+    msg_text = (
+        f"Përshëndetje,\n\n"
+        f"Admini i Grande Studio ka aktivizuar rivendosjen e fjalëkalimit për llogarinë tuaj ({c_val}).\n"
+        f"Hapni aplikacionin Grande Studio ose klikoni linkun më poshtë për të shënuar passwordin e ri:\n"
+        f"{reset_url}\n"
+    )
+
+    if c_type == "email":
+        if SMTP_HOST and SMTP_USER and SMTP_PASS:
+            try:
+                msg = EmailMessage()
+                msg["Subject"] = "Grande Studio — Shëno passwordin e ri"
+                msg["From"] = SMTP_FROM
+                msg["To"] = c_val
+                msg.set_content(msg_text)
+                with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+                    server.starttls()
+                    server.login(SMTP_USER, SMTP_PASS)
+                    server.send_message(msg)
+            except Exception as exc:
+                print(f"[CLIENT EMAIL RESET] Gabim SMTP: {exc}")
+        print(f"\n[GRANDE STUDIO - CLIENT EMAIL RESET] Për: {c_val} | Linku: {reset_url}\n")
+        return f"Email ({c_val})", f"mailto:{c_val}?subject=Grande%20Studio%20-%20Sheno%20passwordin%20e%20ri&body={msg_text.replace(chr(10), '%0A')}"
+
+    ig_handle = c_val.lstrip("@")
+    ig_dm_url = f"https://www.instagram.com/{ig_handle}/"
+    print(f"\n[GRANDE STUDIO - CLIENT INSTAGRAM RESET] Për: @{ig_handle} | Linku: {reset_url}\n")
+    return f"Instagram (@{ig_handle})", ig_dm_url
+
+
+def get_salon_settings() -> dict:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM salon_settings WHERE id = 1")
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return {
+        "work_start": WORK_START,
+        "work_end": WORK_END,
+        "slot_step_min": SLOT_STEP_MIN,
+        "hygiene_note": "Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.",
+    }
+
+
+def send_push_to_admins(title: str, body: str, url: str = "/admin") -> None:
+    if not HAS_WEBPUSH:
         return
     vapid = get_vapid_keys()
     if not vapid.get("private_key"):
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, subscription_json FROM push_subscriptions")
+    subs = cur.fetchall()
+    conn.close()
+
+    if not subs:
         return
 
     payload = json.dumps({
         "title": title,
         "body": body,
         "url": url,
-        "playSound": play_sound,
         "timestamp": datetime.now().isoformat()
     })
 
     dead_ids = []
-    for sub in rows:
+    for sub in subs:
         try:
             sub_info = json.loads(sub["subscription_json"])
             webpush(
@@ -488,47 +538,9 @@ def _deliver_push_payload(rows, table_name: str, title: str, body: str, url: str
     if dead_ids:
         conn = get_db()
         cur = conn.cursor()
-        cur.executemany(f"DELETE FROM {table_name} WHERE id = ?", [(i,) for i in dead_ids])
+        cur.executemany("DELETE FROM push_subscriptions WHERE id = ?", [(i,) for i in dead_ids])
         conn.commit()
         conn.close()
-
-
-def send_push_to_admins(title: str, body: str, url: str = "/admin") -> None:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, subscription_json FROM push_subscriptions")
-    subs = cur.fetchall()
-    conn.close()
-    _deliver_push_payload(subs, "push_subscriptions", title, body, url=url, play_sound=True)
-
-
-def notify_client_message(client_id: int | None, title: str, body: str, event_type: str = "info") -> None:
-    if not client_id:
-        return
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO client_notifications (client_id, title, body, event_type, is_read, created_at)
-        VALUES (?, ?, ?, ?, 0, ?)
-        """,
-        (client_id, title, body, event_type, datetime.now().isoformat()),
-    )
-    cur.execute("SELECT id, subscription_json FROM client_push_subscriptions WHERE client_id = ?", (client_id,))
-    subs = cur.fetchall()
-    conn.commit()
-    conn.close()
-
-    _deliver_push_payload(subs, "client_push_subscriptions", title, body, url="/", play_sound=True)
-
-
-def notify_client_appointment_decision(client_id: int | None, accepted: bool) -> None:
-    if not client_id:
-        return
-    title = "Grande Studio — Termini u Pranua" if accepted else "Grande Studio — Njoftim për Terminin"
-    body = MSG_ACCEPTED if accepted else MSG_REJECTED
-    event_type = "accepted" if accepted else "rejected"
-    notify_client_message(client_id, title, body, event_type=event_type)
 
 
 def get_admin_account():
@@ -591,6 +603,11 @@ def min_to_time(minutes: int) -> str:
 
 
 def get_available_slots(appt_date: str, duration_min: int):
+    settings = get_salon_settings()
+    w_start = settings.get("work_start") or WORK_START
+    w_end = settings.get("work_end") or WORK_END
+    step_min = int(settings.get("slot_step_min") or SLOT_STEP_MIN)
+
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
@@ -603,8 +620,8 @@ def get_available_slots(appt_date: str, duration_min: int):
     busy = [(time_to_min(r["start_time"]), time_to_min(r["end_time"])) for r in cur.fetchall()]
     conn.close()
 
-    start_m = time_to_min(WORK_START)
-    end_m = time_to_min(WORK_END)
+    start_m = time_to_min(w_start)
+    end_m = time_to_min(w_end)
 
     slots = []
     curr = start_m
@@ -614,7 +631,7 @@ def get_available_slots(appt_date: str, duration_min: int):
         overlap = any(not (cand_end <= b_start or cand_start >= b_end) for b_start, b_end in busy)
         if not overlap:
             slots.append(min_to_time(cand_start))
-        curr += SLOT_STEP_MIN
+        curr += step_min
 
     return slots
 
@@ -622,20 +639,21 @@ def get_available_slots(appt_date: str, duration_min: int):
 def get_banner_artwork_html() -> str:
     nails_url = prepare_clean_nails_asset()
     ig_avatar_url = prepare_ig_avatar_asset()
-    v = get_asset_version()
 
     if ig_avatar_url:
-        ig_top_html = f'<img src="{ig_avatar_url}?v={v}" alt="Instagram Grande Studio" class="ig-banner-avatar">'
+        ig_top_html = f'<img src="{ig_avatar_url}" alt="Instagram Grande Studio" class="ig-banner-avatar">'
     else:
-        ig_top_html = '<div class="ig-banner-avatar ig-fallback-badge" aria-hidden="true">IG</div>'
+        ig_top_html = """
+        <div class="ig-banner-avatar ig-fallback-badge" aria-hidden="true">IG</div>
+        """
 
     if nails_url:
-        nails_bottom_html = f'<img src="{nails_url}?v={v}" alt="Grande Studio Nails" class="nails-banner-bottom">'
+        nails_bottom_html = f'<img src="{nails_url}" alt="Grande Studio Nails" class="nails-banner-bottom">'
     else:
         nails_bottom_html = """
         <svg class="nails-banner-bottom" viewBox="0 0 210 68" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <text x="8" y="34" fill="#f276e0" font-size="17" font-weight="900" letter-spacing="0.5">GRANDE STUDIO</text>
-          <text x="8" y="52" fill="#ffffff" font-size="10.5" font-weight="800" letter-spacing="1.1">NAILS - BEAUTY - CARE</text>
+          <text x="8" y="34" fill="#f276e0" font-size="16" font-weight="900" letter-spacing="0.5">GRANDE STUDIO</text>
+          <text x="8" y="52" fill="#ffffff" font-size="9.5" font-weight="800" letter-spacing="1.1">NAILS - BEAUTY - CARE</text>
         </svg>
         """
 
@@ -650,7 +668,7 @@ def get_ig_nav_button_html() -> str:
        onclick="openInstagramProfile(event)"
        class="btn-3d btn-ig-3d"
        title="Hap Instagramin @{IG_USERNAME}">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect>
         <path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path>
         <line x1="17.5" y1="6.5" x2="17.51" y2="6.5"></line>
@@ -685,7 +703,6 @@ BASE_STYLE = """
   body {
     margin: 0;
     min-height: 100vh;
-    font-size: 16px;
     color: var(--text);
     background-color: #26030a;
     background-image:
@@ -701,7 +718,7 @@ BASE_STYLE = """
 
   .studio-stage-label {
     color: #ffdce4;
-    font-size: 0.9rem;
+    font-size: 0.82rem;
     letter-spacing: 0.5px;
     margin-bottom: 10px;
     text-align: center;
@@ -769,7 +786,7 @@ BASE_STYLE = """
     display: flex;
     justify-content: space-between;
     align-items: center;
-    font-size: 0.82rem;
+    font-size: 0.76rem;
     font-weight: 700;
     flex-shrink: 0;
   }
@@ -862,7 +879,7 @@ BASE_STYLE = """
 
   .brand-title {
     margin: 0;
-    font-size: 1.04rem;
+    font-size: 0.94rem;
     letter-spacing: 0.4px;
     font-weight: 800;
     white-space: nowrap;
@@ -871,7 +888,7 @@ BASE_STYLE = """
 
   .brand-sub {
     margin: 2px 0 0;
-    font-size: 0.74rem;
+    font-size: 0.65rem;
     color: #ffd6df;
     white-space: nowrap;
   }
@@ -896,8 +913,8 @@ BASE_STYLE = """
   .btn-vishnje-3d {
     background: linear-gradient(180deg, var(--vishnje-bright), var(--vishnje));
     color: #fff;
-    padding: 11px 15px;
-    font-size: 0.96rem;
+    padding: 10px 14px;
+    font-size: 0.88rem;
     box-shadow: 0 4px 0 var(--vishnje-dark), 0 7px 14px rgba(114, 9, 29, 0.26);
   }
 
@@ -909,7 +926,7 @@ BASE_STYLE = """
     background: rgba(255, 255, 255, 0.15);
     color: #fff;
     padding: 6px 8px;
-    font-size: 0.78rem;
+    font-size: 0.7rem;
     border: 1px solid rgba(255, 255, 255, 0.28);
     box-shadow: 0 3px 0 rgba(45, 2, 10, 0.65);
     white-space: nowrap;
@@ -923,7 +940,7 @@ BASE_STYLE = """
     background: linear-gradient(135deg, #f58529, #dd2a7b 55%, #8134af);
     color: #fff;
     padding: 6px 9px;
-    font-size: 0.8rem;
+    font-size: 0.72rem;
     border: 1px solid rgba(255, 255, 255, 0.42);
     box-shadow: 0 3px 0 rgba(45, 2, 10, 0.7);
     white-space: nowrap;
@@ -970,7 +987,7 @@ BASE_STYLE = """
     background: linear-gradient(135deg, #f58529, #dd2a7b, #8134af);
     color: #fff;
     font-weight: 900;
-    font-size: 1.05rem;
+    font-size: 1rem;
   }
 
   .nails-banner-bottom {
@@ -994,7 +1011,7 @@ BASE_STYLE = """
 
   .combo-banner h3 {
     margin: 0 0 4px;
-    font-size: 1.04rem;
+    font-size: 0.94rem;
     font-weight: 800;
     color: #ffffff;
     text-shadow: 0 2px 6px rgba(25, 1, 5, 0.92);
@@ -1002,7 +1019,7 @@ BASE_STYLE = """
 
   .combo-banner p {
     margin: 0 0 10px;
-    font-size: 0.84rem;
+    font-size: 0.76rem;
     color: #ffffff;
     line-height: 1.38;
     max-width: 56%;
@@ -1023,9 +1040,9 @@ BASE_STYLE = """
     z-index: 4;
     background: rgba(42, 2, 10, 0.86);
     border: 1px solid rgba(255, 255, 255, 0.55);
-    padding: 4px 9px;
+    padding: 4px 8px;
     border-radius: 999px;
-    font-size: 0.78rem;
+    font-size: 0.69rem;
     font-weight: 700;
     color: #ffffff;
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.42);
@@ -1034,7 +1051,7 @@ BASE_STYLE = """
 
   .tabs-bar {
     display: grid;
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     gap: 8px;
     margin-bottom: 13px;
   }
@@ -1044,8 +1061,8 @@ BASE_STYLE = """
     color: var(--vishnje);
     border: 1px solid var(--border);
     border-radius: 12px;
-    padding: 9px 8px;
-    font-size: 0.86rem;
+    padding: 9px 6px;
+    font-size: 0.74rem;
     font-weight: 700;
     cursor: pointer;
     box-shadow: 0 4px 0 #dec0c8;
@@ -1078,122 +1095,9 @@ BASE_STYLE = """
     box-shadow: 0 5px 0 #e6cbd2, 0 10px 20px rgba(74, 4, 17, 0.07);
   }
 
-  .auth-gate-card {
-    border: 2px solid var(--vishnje-bright);
-    background: linear-gradient(180deg, #ffffff, #fff5f7);
-  }
-
-  .auth-mode-switch {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 7px;
-    margin-bottom: 10px;
-  }
-
-  .auth-mode-btn {
-    padding: 8px;
-    border-radius: 10px;
-    border: 1px solid var(--border);
-    background: #fff;
-    color: var(--vishnje);
-    font-size: 0.86rem;
-    font-weight: 800;
-    cursor: pointer;
-  }
-
-  .auth-mode-btn.active {
-    background: linear-gradient(180deg, var(--vishnje-bright), var(--vishnje));
-    color: #fff;
-    border-color: var(--vishnje-dark);
-  }
-
-  .method-choice-row {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 7px;
-    margin-top: 4px;
-    margin-bottom: 6px;
-  }
-
-  .method-chip {
-    padding: 9px 8px;
-    border-radius: 10px;
-    border: 1.5px solid #e2c2ca;
-    background: #fff;
-    color: var(--vishnje-dark);
-    font-size: 0.85rem;
-    font-weight: 800;
-    cursor: pointer;
-    text-align: center;
-  }
-
-  .method-chip.active {
-    background: var(--vishnje-soft);
-    border-color: var(--vishnje-bright);
-    color: var(--vishnje);
-    box-shadow: 0 2px 0 #e6cbd2;
-  }
-
-  .ig-autofill-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 6px;
-    margin-top: 5px;
-    font-size: 0.78rem;
-    color: var(--muted);
-  }
-
-  .ig-mini-btn {
-    background: var(--vishnje-soft);
-    color: var(--vishnje);
-    border: 1px solid #dfb4bf;
-    border-radius: 8px;
-    padding: 4px 8px;
-    font-size: 0.76rem;
-    font-weight: 700;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-
-  .client-session-bar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-    background: #fff3f6;
-    border: 1px solid #f2c4cf;
-    border-radius: 12px;
-    padding: 9px 11px;
-    margin-bottom: 10px;
-    font-size: 0.84rem;
-    color: var(--vishnje-dark);
-  }
-
-  .client-notif-box {
-    border-radius: 14px;
-    padding: 11px 12px;
-    margin-bottom: 11px;
-    font-size: 0.88rem;
-    font-weight: 700;
-    line-height: 1.45;
-  }
-
-  .client-notif-accepted {
-    background: #ebfaef;
-    color: #166534;
-    border: 1.5px solid #86efac;
-  }
-
-  .client-notif-rejected {
-    background: #fff0f2;
-    color: #9f1239;
-    border: 1.5px solid #fda4af;
-  }
-
   h2 {
     margin: 0 0 9px;
-    font-size: 1.08rem;
+    font-size: 0.98rem;
     color: var(--vishnje);
   }
 
@@ -1203,8 +1107,8 @@ BASE_STYLE = """
     color: var(--vishnje);
     border: 1px solid var(--border);
     border-radius: 9px;
-    padding: 6px 10px;
-    font-size: 0.82rem;
+    padding: 5px 9px;
+    font-size: 0.74rem;
     font-weight: 700;
     cursor: pointer;
     box-shadow: 0 3px 0 #dfc2ca;
@@ -1220,7 +1124,7 @@ BASE_STYLE = """
 
   label {
     display: block;
-    font-size: 0.88rem;
+    font-size: 0.8rem;
     font-weight: 700;
     margin: 10px 0 4px;
     color: var(--vishnje-dark);
@@ -1228,10 +1132,10 @@ BASE_STYLE = """
 
   input, select, textarea {
     width: 100%;
-    padding: 10px 11px;
+    padding: 9px 10px;
     border: 1.5px solid #e2c2ca;
     border-radius: 10px;
-    font-size: 0.95rem;
+    font-size: 0.86rem;
     background: #fffdfd;
     color: var(--text);
   }
@@ -1244,12 +1148,12 @@ BASE_STYLE = """
 
   .slots { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .slot-3d {
-    padding: 8px 11px;
+    padding: 7px 10px;
     border-radius: 9px;
     border: 1px solid #dfb9c3;
     background: linear-gradient(180deg, #ffffff, #fdf0f3);
     color: var(--vishnje);
-    font-size: 0.88rem;
+    font-size: 0.8rem;
     font-weight: 700;
     cursor: pointer;
     box-shadow: 0 3px 0 #d6aeb8;
@@ -1281,27 +1185,42 @@ BASE_STYLE = """
     background: var(--vishnje-soft);
     color: var(--vishnje);
     border: 1px solid #e6c2cb;
-    font-size: 0.76rem;
+    font-size: 0.68rem;
     font-weight: 800;
-    padding: 2px 8px;
+    padding: 2px 7px;
     border-radius: 999px;
     margin-bottom: 4px;
   }
 
-  .svc-title { font-weight: 800; font-size: 0.96rem; color: var(--text); }
-  .svc-desc { font-size: 0.86rem; color: var(--muted); line-height: 1.4; margin: 3px 0; }
-  .svc-meta { font-size: 0.88rem; font-weight: 700; color: var(--vishnje); }
+  .svc-title { font-weight: 800; font-size: 0.88rem; color: var(--text); }
+  .svc-desc { font-size: 0.78rem; color: var(--muted); line-height: 1.35; margin: 3px 0; }
 
   .alert {
     padding: 10px 12px;
     border-radius: 12px;
     margin-bottom: 11px;
-    font-size: 0.9rem;
+    font-size: 0.82rem;
     font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
   }
 
   .alert-ok { background: #ebfaef; color: var(--ok); border: 1px solid #a8e4ba; }
   .alert-err { background: #fff0f2; color: var(--warn); border: 1px solid #f7bcc4; }
+
+  .dismiss-btn {
+    background: rgba(0, 0, 0, 0.08);
+    color: inherit;
+    border: none;
+    border-radius: 8px;
+    padding: 4px 8px;
+    font-size: 0.72rem;
+    font-weight: 800;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
 
   @keyframes pulseNew {
     0% { box-shadow: 0 0 0 0 rgba(225, 29, 72, 0.55); }
@@ -1321,7 +1240,7 @@ BASE_STYLE = """
   .badge-new-live {
     background: #e11d48;
     color: #fff;
-    font-size: 0.76rem;
+    font-size: 0.68rem;
     font-weight: 900;
     padding: 3px 8px;
     border-radius: 999px;
@@ -1359,13 +1278,13 @@ BASE_STYLE = """
     gap: 8px;
   }
 
-  table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.76rem; }
   th, td { padding: 7px 5px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
-  th { color: var(--vishnje); font-size: 0.78rem; text-transform: uppercase; }
+  th { color: var(--vishnje); font-size: 0.7rem; text-transform: uppercase; }
 
   .row-is-new { background-color: #fff1f2 !important; }
 
-  .badge { padding: 2px 7px; border-radius: 999px; font-size: 0.76rem; font-weight: 800; }
+  .badge { padding: 2px 7px; border-radius: 999px; font-size: 0.68rem; font-weight: 800; }
   .b-ok { background: #d3f9d8; color: #1f7a3d; }
   .b-blk { background: #ffe3e3; color: #b41e2d; }
   .b-can { background: #f1f3f5; color: #495057; }
@@ -1375,7 +1294,7 @@ BASE_STYLE = """
     border-radius: 8px;
     border: none;
     cursor: pointer;
-    font-size: 0.82rem;
+    font-size: 0.74rem;
     font-weight: 700;
     box-shadow: 0 2px 0 rgba(0,0,0,0.18);
     margin-bottom: 3px;
@@ -1384,16 +1303,6 @@ BASE_STYLE = """
   .btn-sm-3d:active { transform: translateY(2px); box-shadow: none; }
   .btn-del { background: #ffe3e3; color: #b41e2d; }
   .btn-seen { background: #dcfce7; color: #166534; }
-  .btn-reset { background: #fef3c7; color: #92400e; }
-
-  .client-item-card {
-    border: 1px solid var(--border);
-    background: #fff9fb;
-    border-radius: 12px;
-    padding: 10px;
-    margin-bottom: 9px;
-    box-shadow: 0 3px 0 #ead0d7;
-  }
 
   .edit-svc-box {
     border: 1px solid var(--border);
@@ -1404,18 +1313,62 @@ BASE_STYLE = """
     box-shadow: 0 3px 0 #ead0d7;
   }
 
+  .client-list-item {
+    border: 1.5px solid var(--border);
+    background: #fff9fb;
+    border-radius: 12px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+
+  .client-list-item.selected {
+    border-color: var(--vishnje-bright);
+    background: #fff0f4;
+    box-shadow: 0 3px 10px rgba(184, 29, 61, 0.14);
+  }
+
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(20, 4, 8, 0.78);
+    z-index: 9998;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+
+  .modal-card {
+    background: #ffffff;
+    color: #261217;
+    border-radius: 18px;
+    padding: 16px;
+    max-width: 365px;
+    width: 100%;
+    max-height: 82vh;
+    overflow-y: auto;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+    border: 1.5px solid #edd3da;
+  }
+
   .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   @media (max-width: 420px) { .row-2 { grid-template-columns: 1fr; } }
 </style>
 """
 
 
-def render_iphone_shell(title: str, inner_html: str, description: str = "Grande Studio — Rezervime online për Thonj, Qerpikë dhe Vetulla. Zgjidhni trajtimin dhe orarin tuaj me një klikim.") -> str:
+def render_iphone_shell(
+    title: str,
+    inner_html: str,
+    description: str = "Grande Studio — Rezervime online për Thonj, Qerpikë dhe Vetulla. Zgjidhni trajtimin dhe orarin tuaj me një klikim.",
+    role_tag: str = "client",
+) -> str:
     now_clock = datetime.now().strftime("%H:%M")
     base_url = request.url_root.rstrip("/") if request else ""
     canonical_url = f"{base_url}/" if base_url else "/"
-    v = get_asset_version()
-    icon_url = f"{base_url}/static/icon-512.png?v={v}" if base_url else f"/static/icon-512.png?v={v}"
+    icon_url = f"{base_url}/static/icon-512.png" if base_url else "/static/icon-512.png"
 
     schema_json = json.dumps({
         "@context": "https://schema.org",
@@ -1425,7 +1378,6 @@ def render_iphone_shell(title: str, inner_html: str, description: str = "Grande 
         "url": canonical_url,
         "image": icon_url,
         "sameAs": [IG_WEB_URL],
-        "openingHours": f"Mo-Sa {WORK_START}-{WORK_END}",
         "priceRange": "$$"
     }, ensure_ascii=False)
 
@@ -1441,6 +1393,7 @@ def render_iphone_shell(title: str, inner_html: str, description: str = "Grande 
       <meta name="robots" content="index, follow, max-image-preview:large">
       <link rel="canonical" href="{canonical_url}">
 
+      <!-- Open Graph / Social & Google Preview -->
       <meta property="og:type" content="website">
       <meta property="og:site_name" content="Grande Studio">
       <meta property="og:title" content="{title}">
@@ -1448,15 +1401,17 @@ def render_iphone_shell(title: str, inner_html: str, description: str = "Grande 
       <meta property="og:url" content="{canonical_url}">
       <meta property="og:image" content="{icon_url}">
 
+      <!-- PWA & Mobile App Support (iPhone & Samsung) -->
       <meta name="theme-color" content="#72091d">
       <meta name="mobile-web-app-capable" content="yes">
       <meta name="apple-mobile-web-app-capable" content="yes">
       <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
       <meta name="apple-mobile-web-app-title" content="Grande Studio">
-      <link rel="apple-touch-icon" sizes="192x192" href="/static/icon-192.png?v={v}">
-      <link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png?v={v}">
-      <link rel="manifest" href="/manifest.json?v={v}">
+      <link rel="apple-touch-icon" href="/static/icon-192.png">
+      <link rel="icon" type="image/png" href="/static/icon-192.png">
+      <link rel="manifest" href="/manifest.json">
 
+      <!-- Structured Data për Google Search -->
       <script type="application/ld+json">{schema_json}</script>
       {BASE_STYLE}
     </head>
@@ -1476,16 +1431,31 @@ def render_iphone_shell(title: str, inner_html: str, description: str = "Grande 
         </div>
       </div>
       <script>
-        if ('serviceWorker' in navigator) {{
-          window.addEventListener('load', () => {{
-            navigator.serviceWorker.register('/sw.js?v={v}', {{ scope: '/' }}).catch(() => {{}});
-          }});
-        }}
+        const CURRENT_ROLE = '{role_tag}';
+        try {{
+          if (CURRENT_ROLE === 'admin') {{
+            localStorage.setItem('grande_studio_last_role', 'admin');
+          }} else if (CURRENT_ROLE === 'client_logged_in') {{
+            localStorage.setItem('grande_studio_last_role', 'client');
+          }}
+        }} catch (e) {{}}
 
-        function playNotificationChime() {{
+        function unlockAudioContext() {{
           try {{
             const AudioCtx = window.AudioContext || window.webkitAudioContext;
-            const ctx = new AudioCtx();
+            if (!window.__gsAudioCtx) {{
+              window.__gsAudioCtx = new AudioCtx();
+            }}
+            if (window.__gsAudioCtx.state === 'suspended') {{
+              window.__gsAudioCtx.resume().catch(() => {{}});
+            }}
+          }} catch (e) {{}}
+        }}
+
+        function playAutoAlertSound() {{
+          try {{
+            unlockAudioContext();
+            const ctx = window.__gsAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
             const notes = [587.33, 880.00, 1174.66];
             notes.forEach((freq, idx) => {{
               const osc = ctx.createOscillator();
@@ -1514,6 +1484,43 @@ def render_iphone_shell(title: str, inner_html: str, description: str = "Grande 
           return outputArray;
         }}
 
+        async function autoEnableNotificationsAndPush() {{
+          try {{
+            if ('Notification' in window && Notification.permission === 'default') {{
+              await Notification.requestPermission().catch(() => {{}});
+            }}
+            if ('Notification' in window && Notification.permission === 'granted' && 'serviceWorker' in navigator && 'PushManager' in window) {{
+              const reg = await navigator.serviceWorker.ready;
+              const keyRes = await fetch('/api/push/public-key');
+              const keyData = await keyRes.json();
+              if (keyData.publicKey) {{
+                const existingSub = await reg.pushManager.getSubscription();
+                const sub = existingSub || await reg.pushManager.subscribe({{
+                  userVisibleOnly: true,
+                  applicationServerKey: urlBase64ToUint8Array(keyData.publicKey)
+                }});
+                await fetch('/api/push/subscribe', {{
+                  method: 'POST',
+                  headers: {{ 'Content-Type': 'application/json' }},
+                  body: JSON.stringify(sub)
+                }}).catch(() => {{}});
+              }}
+            }}
+          }} catch (e) {{}}
+        }}
+
+        if ('serviceWorker' in navigator) {{
+          window.addEventListener('load', () => {{
+            navigator.serviceWorker.register('/sw.js', {{ scope: '/' }}).then(() => {{
+              autoEnableNotificationsAndPush();
+            }}).catch(() => {{}});
+          }});
+        }}
+
+        window.addEventListener('DOMContentLoaded', () => {{
+          autoEnableNotificationsAndPush();
+        }});
+
         function openInstagramProfile(ev) {{
           if (ev) ev.preventDefault();
           const el = ev && ev.currentTarget ? ev.currentTarget : null;
@@ -1527,6 +1534,26 @@ def render_iphone_shell(title: str, inner_html: str, description: str = "Grande 
             }}
           }}, 650);
         }}
+
+        // Rifreskim i faqes automatikisht pas çdo klikimi pa shkaktuar cikël të pafundëm
+        let __gsReloadTimer = null;
+        document.addEventListener('click', function(ev) {{
+          unlockAudioContext();
+          autoEnableNotificationsAndPush();
+          const target = ev.target;
+          if (!target) return;
+          if (target.closest('a[href]')) return;
+          if (target.closest('form')) return;
+          if (target.closest('[data-no-auto-refresh]')) return;
+          if (target.closest('input, select, textarea')) return;
+
+          if (__gsReloadTimer) clearTimeout(__gsReloadTimer);
+          __gsReloadTimer = setTimeout(function() {{
+            if (document.visibilityState === 'visible') {{
+              window.location.reload();
+            }}
+          }}, 180);
+        }}, true);
       </script>
     </body>
     </html>
@@ -1578,21 +1605,19 @@ def static_files(filename):
 
 @app.route("/manifest.json")
 def manifest():
-    prepare_ig_avatar_asset()
     prepare_app_icons()
-    v = get_asset_version()
     icons = [
         {
-            "src": f"/static/icon-192.png?v={v}",
+            "src": "/static/icon-192.png",
             "sizes": "192x192",
             "type": "image/png",
-            "purpose": "any"
+            "purpose": "any maskable"
         },
         {
-            "src": f"/static/icon-512.png?v={v}",
+            "src": "/static/icon-512.png",
             "sizes": "512x512",
             "type": "image/png",
-            "purpose": "any"
+            "purpose": "any maskable"
         }
     ]
 
@@ -1605,115 +1630,110 @@ def manifest():
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
-        "background_color": "#34040d",
+        "background_color": "#fdf6f7",
         "theme_color": "#72091d",
         "icons": icons,
     })
-    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["Cache-Control"] = "public, max-age=3600"
     return resp
 
 
 @app.route("/sw.js")
 def service_worker():
-    v = get_asset_version()
-    js = f"""
-    const CACHE_NAME = 'grande-studio-{v}';
+    js = """
+    const CACHE_NAME = 'grande-studio-v5';
     const CORE_ASSETS = [
-      '/manifest.json?v={v}',
-      '/static/icon-192.png?v={v}',
-      '/static/icon-512.png?v={v}'
+      '/',
+      '/manifest.json',
+      '/static/icon-192.png',
+      '/static/icon-512.png'
     ];
 
-    self.addEventListener('install', event => {{
+    self.addEventListener('install', event => {
       event.waitUntil(
-        caches.open(CACHE_NAME).then(cache => cache.addAll(CORE_ASSETS).catch(() => {{}}))
+        caches.open(CACHE_NAME).then(cache => cache.addAll(CORE_ASSETS).catch(() => {}))
       );
       self.skipWaiting();
-    }});
+    });
 
-    self.addEventListener('activate', event => {{
+    self.addEventListener('activate', event => {
       event.waitUntil(
         caches.keys().then(keys =>
           Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
         )
       );
       self.clients.claim();
-    }});
+    });
 
-    self.addEventListener('fetch', event => {{
+    self.addEventListener('fetch', event => {
       if (event.request.method !== 'GET') return;
       const url = new URL(event.request.url);
       if (url.origin !== self.location.origin) return;
 
-      if (url.pathname === '/' || url.pathname.startsWith('/api/') || url.pathname.startsWith('/admin')) {{
-        event.respondWith(fetch(event.request, {{ cache: 'no-store' }}));
+      if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/admin')) {
+        event.respondWith(fetch(event.request));
         return;
-      }}
+      }
 
       event.respondWith(
         fetch(event.request)
-          .then(resp => {{
-            if (resp && resp.status === 200) {{
+          .then(resp => {
+            if (resp && resp.status === 200) {
               const copy = resp.clone();
               caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy));
-            }}
+            }
             return resp;
-          }})
-          .catch(() => caches.match(event.request))
+          })
+          .catch(() => caches.match(event.request).then(cached => cached || caches.match('/')))
       );
-    }});
+    });
 
-    self.addEventListener('push', event => {{
-      let data = {{
-        title: 'Njoftim — Grande Studio',
-        body: 'Keni një njoftim të ri nga Grande Studio.',
-        url: '/'
-      }};
-      if (event.data) {{
-        try {{
+    self.addEventListener('push', event => {
+      let data = {
+        title: 'Rezervim i Ri — Grande Studio',
+        body: 'Një klient ka bërë një rezervim të ri!',
+        url: '/admin'
+      };
+      if (event.data) {
+        try {
           data = Object.assign(data, event.data.json());
-        }} catch (e) {{
+        } catch (e) {
           data.body = event.data.text();
-        }}
-      }}
+        }
+      }
 
-      const options = {{
+      const options = {
         body: data.body,
-        icon: '/static/icon-192.png?v={v}',
-        badge: '/static/icon-192.png?v={v}',
+        icon: '/static/icon-192.png',
+        badge: '/static/icon-192.png',
         vibrate: [300, 150, 300, 150, 400],
-        tag: 'grande-studio-alert',
+        tag: 'grande-studio-new-booking',
         renotify: true,
         requireInteraction: true,
-        data: {{ url: data.url || '/' }}
-      }};
+        data: { url: data.url || '/admin' }
+      };
 
       event.waitUntil(
-        self.registration.showNotification(data.title, options).then(() =>
-          clients.matchAll({{ type: 'window', includeUncontrolled: true }}).then(clientList => {{
-            clientList.forEach(c => c.postMessage({{ type: 'PLAY_CHIME', payload: data }}));
-          }})
-        )
+        self.registration.showNotification(data.title, options)
       );
-    }});
+    });
 
-    self.addEventListener('notificationclick', event => {{
+    self.addEventListener('notificationclick', event => {
       event.notification.close();
-      const targetUrl = (event.notification.data && event.notification.data.url) || '/';
+      const targetUrl = (event.notification.data && event.notification.data.url) || '/admin';
       event.waitUntil(
-        clients.matchAll({{ type: 'window', includeUncontrolled: true }}).then(clientList => {{
-          for (const client of clientList) {{
-            if ('focus' in client) {{
-              client.postMessage({{ type: 'PLAY_CHIME' }});
+        clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clientList => {
+          for (const client of clientList) {
+            if (client.url.includes('/admin') && 'focus' in client) {
               return client.focus();
-            }}
-          }}
-          if (clients.openWindow) {{
+            }
+          }
+          if (clients.openWindow) {
             return clients.openWindow(targetUrl);
-          }}
-        }})
+          }
+        })
       );
-    }});
+    });
     """
     resp = Response(js, mimetype="application/javascript")
     resp.headers["Cache-Control"] = "no-cache"
@@ -1727,7 +1747,6 @@ def api_push_public_key():
 
 
 @app.route("/api/push/subscribe", methods=["POST"])
-@admin_required
 def api_push_subscribe():
     data = request.get_json(silent=True)
     if not data or not data.get("endpoint"):
@@ -1748,78 +1767,6 @@ def api_push_subscribe():
     return jsonify({"ok": True})
 
 
-@app.route("/api/client/push/subscribe", methods=["POST"])
-def api_client_push_subscribe():
-    client_id = session.get("client_id")
-    if not client_id:
-        return jsonify({"ok": False, "error": "Nuk jeni e kyçur si kliente."}), 401
-
-    data = request.get_json(silent=True)
-    if not data or not data.get("endpoint"):
-        return jsonify({"ok": False, "error": "Abonim i pavlefshëm"}), 400
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO client_push_subscriptions (client_id, endpoint, subscription_json, created_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(endpoint) DO UPDATE SET client_id = excluded.client_id, subscription_json = excluded.subscription_json
-        """,
-        (client_id, data["endpoint"], json.dumps(data), datetime.now().isoformat()),
-    )
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/client/notifications")
-def api_client_notifications():
-    client_id = session.get("client_id")
-    if not client_id:
-        return jsonify({"notifications": [], "reset_required": False})
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT is_blocked, password_reset_required FROM client_accounts WHERE id = ?", (client_id,))
-    acc = cur.fetchone()
-    if not acc or acc["is_blocked"] == 1:
-        conn.close()
-        return jsonify({"notifications": [], "reset_required": False, "blocked": True})
-
-    cur.execute(
-        """
-        SELECT id, title, body, event_type, is_read, created_at
-        FROM client_notifications
-        WHERE client_id = ?
-        ORDER BY id DESC
-        LIMIT 10
-        """,
-        (client_id,),
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return jsonify({
-        "notifications": rows,
-        "reset_required": bool(acc["password_reset_required"] == 1),
-        "blocked": False
-    })
-
-
-@app.route("/api/client/notifications/read", methods=["POST"])
-def api_client_notifications_read():
-    client_id = session.get("client_id")
-    if not client_id:
-        return jsonify({"ok": False}), 401
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE client_notifications SET is_read = 1 WHERE client_id = ? AND is_read = 0", (client_id,))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
-
-
 @app.route("/api/admin/new-bookings")
 @admin_required
 def api_admin_new_bookings():
@@ -1827,8 +1774,7 @@ def api_admin_new_bookings():
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT a.id, a.client_name, a.client_phone, a.client_instagram, a.client_email,
-               a.appt_date, a.start_time, a.end_time, a.notes, a.created_at,
+        SELECT a.id, a.client_name, a.client_phone, a.appt_date, a.start_time, a.end_time, a.notes, a.created_at,
                s.name AS service_name, s.category
         FROM appointments a
         LEFT JOIN services s ON a.service_id = s.id
@@ -1839,6 +1785,33 @@ def api_admin_new_bookings():
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return jsonify({"count": len(rows), "bookings": rows})
+
+
+@app.route("/api/admin/auto-save-settings", methods=["POST"])
+@admin_required
+def api_admin_auto_save_settings():
+    data = request.get_json(silent=True) or {}
+    w_start = (data.get("work_start") or WORK_START).strip()
+    w_end = (data.get("work_end") or WORK_END).strip()
+    try:
+        step_min = int(data.get("slot_step_min") or SLOT_STEP_MIN)
+    except Exception:
+        step_min = SLOT_STEP_MIN
+    hygiene_note = (data.get("hygiene_note") or "").strip()
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE salon_settings
+        SET work_start = ?, work_end = ?, slot_step_min = ?, hygiene_note = ?, updated_at = ?
+        WHERE id = 1
+        """,
+        (w_start, w_end, max(15, step_min), hygiene_note, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "saved_at": datetime.now().strftime("%H:%M:%S")})
 
 
 @app.route("/api/slots")
@@ -1863,11 +1836,16 @@ def api_slots():
 @app.route("/", methods=["GET", "POST"])
 def index():
     init_db()
+    if session.get("admin_logged_in"):
+        return redirect(url_for("admin_panel"))
+
     prepare_clean_nails_asset()
     prepare_ig_avatar_asset()
     prepare_app_icons()
     banner_art_html = get_banner_artwork_html()
     ig_nav_html = get_ig_nav_button_html()
+    settings = get_salon_settings()
+
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
@@ -1877,446 +1855,293 @@ def index():
 
     msg = None
     msg_type = "ok"
-    auth_mode = "register"
-    reg_method = "instagram"
     active_tab = request.form.get("active_tab") or request.args.get("tab") or "book"
+    if active_tab == "beauty":
+        active_tab = "book"
+
+    reset_token_param = (request.args.get("reset_token") or "").strip()
+    pending_reset_client = None
+
+    if reset_token_param:
+        cur.execute("SELECT * FROM clients WHERE reset_pending = 1 AND reset_token = ?", (reset_token_param,))
+        pending_reset_client = cur.fetchone()
+    elif session.get("client_id"):
+        cur.execute("SELECT * FROM clients WHERE id = ? AND reset_pending = 1", (session["client_id"],))
+        pending_reset_client = cur.fetchone()
+
     today_str = datetime.now().strftime("%Y-%m-%d")
 
     if request.method == "POST":
-        form_type = request.form.get("form_type", "booking")
+        post_mode = request.form.get("post_mode", "booking")
 
-        if form_type == "client_register":
-            auth_mode = "register"
-            reg_method = request.form.get("reg_method", "instagram").strip().lower()
-            if reg_method not in ("instagram", "email"):
-                reg_method = "instagram"
+        if post_mode == "client_auth":
+            raw_contact = request.form.get("auth_contact", "").strip()
+            raw_password = request.form.get("auth_password", "")
+            full_name_in = request.form.get("auth_full_name", "").strip()
+            phone_in = request.form.get("auth_phone", "").strip()
+            c_type, c_val = normalize_contact_identifier(raw_contact)
 
-            ig_handle = normalize_ig_handle(request.form.get("reg_instagram", "")) if reg_method == "instagram" else ""
-            email_in = request.form.get("reg_email", "").strip().lower() if reg_method == "email" else ""
-            phone_in = request.form.get("reg_phone", "").strip()
-            pwd_in = request.form.get("reg_password", "")
-
-            if reg_method == "instagram" and (not ig_handle or len(ig_handle) < 2):
-                msg = "Ju zgjodhët variantin me Instagram: shkruani llogarinë e Instagramit."
-                msg_type = "err"
-            elif reg_method == "email" and (not email_in or "@" not in email_in):
-                msg = "Ju zgjodhët variantin me Email: shkruani një adresë të vlefshme emaili."
-                msg_type = "err"
-            elif not phone_in or len(re.sub(r"\D", "", phone_in)) < 6:
-                msg = "Numri i telefonit është i detyrueshëm."
-                msg_type = "err"
-            elif len(pwd_in) < 6:
-                msg = "Fjalëkalimi (password) është i detyrueshëm dhe duhet të ketë të paktën 6 karaktere."
+            if not c_val or len(raw_password) < 4:
+                msg = "Ju lutem shkruani Email-in ose Instagram-in dhe një password (të paktën 4 karaktere)."
                 msg_type = "err"
             else:
-                existing = None
-                if reg_method == "instagram":
-                    cur.execute("SELECT id, is_blocked FROM client_accounts WHERE LOWER(instagram) = LOWER(?)", (ig_handle,))
-                    existing = cur.fetchone()
-                else:
-                    cur.execute("SELECT id, is_blocked FROM client_accounts WHERE LOWER(email) = ?", (email_in,))
-                    existing = cur.fetchone()
-
-                if existing:
-                    if existing["is_blocked"] == 1:
-                        msg = "Kjo llogari është e bllokuar nga administratori."
-                        msg_type = "err"
+                cur.execute("SELECT * FROM clients WHERE contact_value = ?", (c_val,))
+                existing_client = cur.fetchone()
+                if existing_client:
+                    if existing_client["reset_pending"] == 1:
+                        pending_reset_client = existing_client
+                        msg = "Admini ka dërguar rivendosje të passwordit. Ju lutem shënoni passwordin e ri."
+                        msg_type = "ok"
+                    elif check_password_hash(existing_client["password_hash"], raw_password):
+                        session.permanent = True
+                        session["client_logged_in"] = True
+                        session["client_id"] = existing_client["id"]
+                        session["client_contact"] = existing_client["contact_value"]
+                        session["client_contact_type"] = existing_client["contact_type"]
+                        session["client_name"] = existing_client["full_name"] or existing_client["contact_value"]
+                        session["client_phone"] = existing_client["client_phone"] or ""
+                        msg = f"Mirësevini, {existing_client['contact_value']}! Jeni të kyçur në llogarinë tuaj."
+                        msg_type = "ok"
                     else:
-                        msg = "Kjo llogari ekziston tashmë. Ju lutem kyçuni me fjalëkalimin tuaj."
+                        msg = "Passwordi është i pasaktë. Nëse e keni harruar, kontaktoni adminin për 'Refresko Password'."
                         msg_type = "err"
-                        auth_mode = "login"
                 else:
+                    now_iso = datetime.now().isoformat()
+                    display_name = full_name_in or c_val
                     cur.execute(
                         """
-                        INSERT INTO client_accounts (auth_method, instagram, email, phone, password_hash, is_blocked, password_reset_required, created_at)
-                        VALUES (?, ?, ?, ?, ?, 0, 0, ?)
+                        INSERT INTO clients (full_name, contact_type, contact_value, client_phone, password_hash, reset_pending, reset_token, reset_sent_via, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, 0, '', '', ?, ?)
                         """,
-                        (reg_method, ig_handle, email_in, phone_in, generate_password_hash(pwd_in), datetime.now().isoformat()),
+                        (display_name, c_type, c_val, phone_in, generate_password_hash(raw_password), now_iso, now_iso),
                     )
-                    conn.commit()
                     new_client_id = cur.lastrowid
+                    conn.commit()
+                    session.permanent = True
+                    session["client_logged_in"] = True
                     session["client_id"] = new_client_id
-                    ident_label = ig_handle if reg_method == "instagram" else email_in
-                    msg = f"Regjistrimi u krye me sukses ({ident_label})! Tani mund të bëni rezervimin."
+                    session["client_contact"] = c_val
+                    session["client_contact_type"] = c_type
+                    session["client_name"] = display_name
+                    session["client_phone"] = phone_in
+                    msg = f"Llogaria u regjistrua dhe u kyçët me {c_val}!"
                     msg_type = "ok"
-                    active_tab = "book"
+            active_tab = "book"
 
-        elif form_type == "client_login":
-            auth_mode = "login"
-            login_id = request.form.get("login_identifier", "").strip()
-            login_pwd = request.form.get("login_password", "")
+        elif post_mode == "client_set_new_password":
+            target_client_id = request.form.get("reset_client_id", type=int)
+            target_token = request.form.get("reset_token", "").strip()
+            new_pwd = request.form.get("new_client_password", "")
+            conf_pwd = request.form.get("confirm_client_password", "")
 
-            if not login_id or not login_pwd:
-                msg = "Plotësoni Instagramin ose emailin dhe fjalëkalimin për t'u kyçur."
+            cur.execute("SELECT * FROM clients WHERE id = ? AND reset_pending = 1", (target_client_id,))
+            target_cli = cur.fetchone()
+            if not target_cli or (target_cli["reset_token"] and target_token != target_cli["reset_token"]):
+                msg = "Kërkesa për ndërrimin e passwordit nuk është e vlefshme."
                 msg_type = "err"
-            else:
-                ig_cand = normalize_ig_handle(login_id)
-                email_cand = login_id.lower()
-                cur.execute(
-                    """
-                    SELECT * FROM client_accounts
-                    WHERE LOWER(email) = ? OR (instagram != '' AND LOWER(instagram) = LOWER(?))
-                    """,
-                    (email_cand, ig_cand),
-                )
-                acc_row = cur.fetchone()
-                if acc_row and acc_row["is_blocked"] == 1:
-                    msg = "Llogaria juaj është e bllokuar nga administratori."
-                    msg_type = "err"
-                elif acc_row and check_password_hash(acc_row["password_hash"], login_pwd):
-                    session["client_id"] = acc_row["id"]
-                    ident_label = acc_row["instagram"] or acc_row["email"]
-                    msg = f"U kyçët me sukses ({ident_label})!"
-                    msg_type = "ok"
-                    active_tab = "book"
-                else:
-                    msg = "Instagrami/Emaili ose fjalëkalimi është i pasaktë."
-                    msg_type = "err"
-
-        elif form_type == "client_set_new_password":
-            cur.execute("SELECT * FROM client_accounts WHERE id = ?", (session.get("client_id") or -1,))
-            current_client = cur.fetchone()
-            new_cpwd = request.form.get("new_client_password", "")
-            conf_cpwd = request.form.get("confirm_client_password", "")
-
-            if not current_client or current_client["is_blocked"] == 1:
-                msg = "Llogaria nuk është aktive."
+            elif len(new_pwd) < 4:
+                pending_reset_client = target_cli
+                msg = "Passwordi i ri duhet të ketë të paktën 4 karaktere."
                 msg_type = "err"
-            elif len(new_cpwd) < 6:
-                msg = "Fjalëkalimi i ri duhet të ketë të paktën 6 karaktere."
-                msg_type = "err"
-            elif new_cpwd != conf_cpwd:
-                msg = "Konfirmimi i fjalëkalimit të ri nuk përputhet."
+            elif new_pwd != conf_pwd:
+                pending_reset_client = target_cli
+                msg = "Passwordet nuk përputhen. Shënoni sërish passwordin e ri."
                 msg_type = "err"
             else:
                 cur.execute(
                     """
-                    UPDATE client_accounts
-                    SET password_hash = ?, password_reset_required = 0
+                    UPDATE clients
+                    SET password_hash = ?, reset_pending = 0, reset_token = '', updated_at = ?
                     WHERE id = ?
                     """,
-                    (generate_password_hash(new_cpwd), current_client["id"]),
+                    (generate_password_hash(new_pwd), datetime.now().isoformat(), target_cli["id"]),
                 )
                 conn.commit()
-                msg = "Password-i juaj i ri u ruajt me sukses! Tani mund të vazhdoni me rezervimin."
+                pending_reset_client = None
+                session.permanent = True
+                session["client_logged_in"] = True
+                session["client_id"] = target_cli["id"]
+                session["client_contact"] = target_cli["contact_value"]
+                session["client_contact_type"] = target_cli["contact_type"]
+                session["client_name"] = target_cli["full_name"] or target_cli["contact_value"]
+                session["client_phone"] = target_cli["client_phone"] or ""
+                msg = f"Passwordi i ri u ruajt dhe jeni kyçur automatikisht si {target_cli['contact_value']}!"
                 msg_type = "ok"
-                active_tab = "book"
-
-        elif form_type == "client_logout":
-            session.pop("client_id", None)
-            msg = "Jeni çkyçur. Për të bërë rezervim, regjistrohuni ose kyçuni."
-            msg_type = "ok"
+            active_tab = "book"
 
         else:
-            cur.execute("SELECT * FROM client_accounts WHERE id = ?", (session.get("client_id") or -1,))
-            current_client = cur.fetchone()
+            raw_contact_book = (request.form.get("client_contact") or session.get("client_contact") or "").strip()
+            _, norm_contact_book = normalize_contact_identifier(raw_contact_book)
+            client_name = (request.form.get("client_name") or session.get("client_name") or norm_contact_book).strip()
+            client_phone = (request.form.get("client_phone") or session.get("client_phone") or "").strip()
+            service_id = request.form.get("service_id", type=int)
+            appt_date = request.form.get("appt_date", "").strip()
+            start_time = request.form.get("start_time", "").strip()
+            notes = request.form.get("notes", "").strip()
 
-            if not current_client:
-                msg = "Nuk mund të bëni rezervim pa u regjistruar fillimisht! Zgjidhni variantin me Instagram ose Email, plus telefonin dhe password-in."
-                msg_type = "err"
-                active_tab = "book"
-            elif current_client["is_blocked"] == 1:
-                session.pop("client_id", None)
-                msg = "Llogaria juaj është e bllokuar dhe nuk mund të bëni rezervime."
-                msg_type = "err"
-                active_tab = "book"
-            elif current_client["password_reset_required"] == 1:
-                msg = "Ju lutem futni një password të ri para se të bëni rezervim."
+            cur.execute("SELECT * FROM services WHERE id = ?", (service_id,))
+            svc = cur.fetchone()
+
+            if not (norm_contact_book or client_name) or not client_phone or not svc or not appt_date or not start_time:
+                msg = "Ju lutem plotësoni të gjitha fushat e detyrueshme dhe zgjidhni një orar."
                 msg_type = "err"
                 active_tab = "book"
             else:
-                default_label = current_client["instagram"] or current_client["email"]
-                client_name = (request.form.get("client_name", "").strip() or default_label)
-                client_phone = current_client["phone"]
-                client_ig = current_client["instagram"]
-                client_email = current_client["email"]
-                service_id = request.form.get("service_id", type=int)
-                appt_date = request.form.get("appt_date", "").strip()
-                start_time = request.form.get("start_time", "").strip()
-                notes = request.form.get("notes", "").strip()
-
-                cur.execute("SELECT * FROM services WHERE id = ?", (service_id,))
-                svc = cur.fetchone()
-
-                if not svc or not appt_date or not start_time:
-                    msg = "Ju lutem zgjidhni artikullin, datën dhe një orar të lirë."
+                valid_slots = get_available_slots(appt_date, svc["duration_min"])
+                if start_time not in valid_slots:
+                    msg = "Ky orar nuk është më i lirë ose nuk mjafton për kohëzgjatjen e shërbimit."
                     msg_type = "err"
                     active_tab = "book"
                 else:
-                    valid_slots = get_available_slots(appt_date, svc["duration_min"])
-                    if start_time not in valid_slots:
-                        msg = "Ky orar nuk është më i lirë ose nuk mjafton për kohëzgjatjen e shërbimit."
-                        msg_type = "err"
-                        active_tab = "book"
-                    else:
-                        end_time = min_to_time(time_to_min(start_time) + svc["duration_min"])
+                    end_time = min_to_time(time_to_min(start_time) + svc["duration_min"])
+                    display_client_label = f"{client_name} ({norm_contact_book})" if norm_contact_book and norm_contact_book not in client_name else client_name
+                    cur.execute(
+                        """
+                        INSERT INTO appointments
+                        (client_name, client_phone, service_id, appt_date, start_time, end_time, notes, status, is_new, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 'Konfirmuar', 1, ?)
+                        """,
+                        (
+                            display_client_label,
+                            client_phone,
+                            service_id,
+                            appt_date,
+                            start_time,
+                            end_time,
+                            notes,
+                            datetime.now().isoformat(),
+                        ),
+                    )
+                    if session.get("client_id"):
                         cur.execute(
-                            """
-                            INSERT INTO appointments
-                            (client_id, client_name, client_phone, client_instagram, client_email,
-                             service_id, appt_date, start_time, end_time, notes, status, is_new, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Konfirmuar', 1, ?)
-                            """,
-                            (
-                                current_client["id"],
-                                client_name,
-                                client_phone,
-                                client_ig,
-                                client_email,
-                                service_id,
-                                appt_date,
-                                start_time,
-                                end_time,
-                                notes,
-                                datetime.now().isoformat(),
-                            ),
+                            "UPDATE clients SET full_name = ?, client_phone = ?, updated_at = ? WHERE id = ?",
+                            (client_name, client_phone, datetime.now().isoformat(), session["client_id"]),
                         )
-                        conn.commit()
+                    conn.commit()
 
-                        contact_info = client_ig if client_ig else client_email
-                        send_push_to_admins(
-                            title=f"🔔 Rezervim i Ri: {client_name}",
-                            body=f"{svc['name']} • {appt_date} {start_time} • {contact_info} • Tel: {client_phone}",
-                            url="/admin"
-                        )
+                    send_push_to_admins(
+                        title=f"🔔 Rezervim i Ri: {display_client_label}",
+                        body=f"{svc['name']} • Data: {appt_date} në {start_time} • Tel: {client_phone}",
+                        url="/admin"
+                    )
 
-                        msg = f"Rezervimi te Grande Studio u regjistrua për {client_name} më {appt_date} në ora {start_time}."
-                        msg_type = "ok"
-                        active_tab = "book"
+                    msg = f"Rezervimi te Grande Studio u konfirmua për {display_client_label} më {appt_date} në ora {start_time} ({svc['name']})."
+                    msg_type = "ok"
+                    active_tab = "book"
 
-    logged_client = None
-    client_notifs = []
-    if session.get("client_id"):
-        cur.execute("SELECT * FROM client_accounts WHERE id = ?", (session["client_id"],))
-        row_c = cur.fetchone()
-        if row_c and row_c["is_blocked"] == 1:
-            session.pop("client_id", None)
-            msg = "Llogaria juaj është e bllokuar nga administratori."
-            msg_type = "err"
-        else:
-            logged_client = row_c
-            if logged_client:
-                cur.execute(
-                    """
-                    SELECT * FROM client_notifications
-                    WHERE client_id = ?
-                    ORDER BY id DESC
-                    LIMIT 5
-                    """,
-                    (logged_client["id"],),
-                )
-                client_notifs = cur.fetchall()
     conn.close()
+
+    saved_client_contact = session.get("client_contact", "")
+    saved_client_name = session.get("client_name", "")
+    saved_client_phone = session.get("client_phone", "")
+    is_client_logged_in = bool(session.get("client_logged_in") and saved_client_contact)
+    role_tag = "client_logged_in" if is_client_logged_in else "client"
 
     service_options = "\n".join(
         f'<option value="{s["id"]}" data-cat="{s["category"]}" data-dur="{s["duration_min"]}">[{s["category"]}] {s["name"]} — {s["duration_min"]} min ({s["price"]:.0f}€)</option>'
         for s in services
     )
 
-    beauty_cards_html = ""
-    for s in services:
-        beauty_cards_html += f"""
-        <div class="svc-card-3d" data-cat-card="{s['category']}">
-          <div>
-            <span class="svc-tag">{s['category']}</span>
-            <div class="svc-title">{s['name']}</div>
-            <div class="svc-desc">{s['description']}</div>
-          </div>
-          <div>
-            <div class="svc-meta">{s['duration_min']} min • {s['price']:.2f}€</div>
-            <button type="button" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:7px; padding:8px 10px; font-size:0.86rem;"
-              onclick="selectServiceAndBook({s['id']})">
-              Rezervo Këtë Artikull
-            </button>
-          </div>
-        </div>
-        """
-
     alert_html = ""
     if msg:
         cls = "alert-ok" if msg_type == "ok" else "alert-err"
-        alert_html = f'<div class="alert {cls}">{msg}</div>'
-
-    client_notifs_html = ""
-    if client_notifs:
-        items_html = ""
-        for n in client_notifs:
-            box_cls = "client-notif-accepted" if n["event_type"] == "accepted" else "client-notif-rejected"
-            icon_txt = "✅" if n["event_type"] == "accepted" else "🔔"
-            items_html += f'<div class="client-notif-box {box_cls}">{icon_txt} {n["body"]}</div>'
-        client_notifs_html = f"""
-        <div class="card-3d">
-          <h2>🔔 Njoftimet e Terminit &amp; Llogarisë</h2>
-          {items_html}
+        alert_html = f"""
+        <div class="alert {cls}" id="clientAlertBox">
+          <span>{msg}</span>
+          <button type="button" class="dismiss-btn" data-no-auto-refresh onclick="this.parentElement.remove()">Hiq ✕</button>
         </div>
         """
 
-    reset_pwd_box_html = ""
-    if logged_client and logged_client["password_reset_required"] == 1:
-        reset_pwd_box_html = """
-        <div class="card-3d" style="border: 2px solid #d97706; background: #fffbeb;">
-          <h2 style="color:#92400e;">🔑 Vendos Password të Ri</h2>
-          <p style="margin:0 0 8px; font-size:0.86rem; color:#78350f;">
-            Admini ka kërkuar resetimin e password-it tuaj. Futni një password të ri (min. 6 karaktere).
+    new_password_modal_html = ""
+    if pending_reset_client:
+        new_password_modal_html = f"""
+        <div class="modal-overlay" id="clientNewPasswordModal" data-no-auto-refresh>
+          <div class="modal-card" data-no-auto-refresh>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+              <b style="color:#72091d; font-size:1rem;">🔐 Shëno passwordin e ri</b>
+            </div>
+            <p style="margin:0 0 10px; font-size:0.78rem; color:var(--muted); line-height:1.45;">
+              Llogaria: <b>{pending_reset_client['contact_value']}</b><br>
+              Shënoni passwordin e ri për të hyrë në llogarinë tuaj.
+            </p>
+            <form method="POST">
+              <input type="hidden" name="post_mode" value="client_set_new_password">
+              <input type="hidden" name="reset_client_id" value="{pending_reset_client['id']}">
+              <input type="hidden" name="reset_token" value="{pending_reset_client['reset_token']}">
+              <label for="new_client_password">Shëno passwordin e ri</label>
+              <input type="password" name="new_client_password" id="new_client_password" placeholder="Shkruani passwordin e ri..." required autofocus>
+              <label for="confirm_client_password">Konfirmo passwordin e ri</label>
+              <input type="password" name="confirm_client_password" id="confirm_client_password" placeholder="Përsëritni passwordin e ri..." required>
+              <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px;">
+                Ruaj Passwordin e Ri &amp; Kyçu
+              </button>
+            </form>
+          </div>
+        </div>
+        """
+
+    client_login_card = ""
+    if is_client_logged_in:
+        client_login_card = f"""
+        <div class="card-3d" style="padding:10px 12px; background:#fff9fb;">
+          <div style="font-size:0.78rem; color:var(--vishnje-dark);">
+            <b>👤 Klienti i kyçur:</b> {saved_client_contact}
+          </div>
+          <div style="font-size:0.7rem; color:var(--muted); margin-top:2px;">
+            Jeni të kyçur automatikisht. Edhe nëse e mbyllni aplikacionin, do të hapet direkt te tabi i klientit.
+          </div>
+        </div>
+        """
+    else:
+        client_login_card = f"""
+        <div class="card-3d" style="padding:12px;">
+          <h2>👤 Kyçja / Regjistrimi i Klientit</h2>
+          <p style="margin:0 0 8px; font-size:0.76rem; color:var(--muted);">
+            Kyçuni me <b>Email</b> ose <b>Instagram</b> dhe <b>Password</b>. Pas kyçjes, mbeteni të kyçur automatikisht.
           </p>
           <form method="POST">
-            <input type="hidden" name="form_type" value="client_set_new_password">
-            <input type="hidden" name="active_tab" value="book">
-            <label for="new_client_password">Password-i i Ri *</label>
-            <input type="password" name="new_client_password" id="new_client_password" minlength="6" required>
-            <label for="confirm_client_password">Konfirmo Password-in e Ri *</label>
-            <input type="password" name="confirm_client_password" id="confirm_client_password" minlength="6" required>
-            <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px;">
-              💾 Ruaj Password-in e Ri
-            </button>
-          </form>
-        </div>
-        """
-
-    if logged_client:
-        main_ident = logged_client["instagram"] or logged_client["email"]
-        client_auth_section = f"""
-        <div class="client-session-bar">
-          <div>
-            <b>✅ Llogaria e Klientes:</b> {main_ident}<br>
-            <span style="font-size:0.78rem; color:var(--muted);">Tel: {logged_client['phone']}</span>
-          </div>
-          <form method="POST" style="margin:0;">
-            <input type="hidden" name="form_type" value="client_logout">
-            <input type="hidden" name="active_tab" value="book">
-            <button type="submit" class="btn-sm-3d btn-del">Dil</button>
-          </form>
-        </div>
-        {reset_pwd_box_html}
-        <div class="card-3d" style="padding:11px 12px;">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
-            <div style="font-size:0.82rem; color:var(--muted); line-height:1.35;">
-              <b style="color:var(--vishnje);">🔔 Njoftimet me Zë</b> (edhe me app të mbyllur)
-            </div>
-            <button type="button" onclick="enableClientNotifications()" class="btn-3d btn-vishnje-3d" style="padding:7px 10px; font-size:0.78rem; white-space:nowrap;">
-              Aktivizo Zërin &amp; Push
-            </button>
-          </div>
-          <div id="clientPushStatus" style="font-size:0.78rem; font-weight:700; color:var(--vishnje); margin-top:5px;"></div>
-        </div>
-        """
-        booking_form_lock_note = ""
-        booking_disabled_attr = ""
-    else:
-        reg_active = "active" if auth_mode == "register" else ""
-        login_active = "active" if auth_mode == "login" else ""
-        reg_display = "block" if auth_mode == "register" else "none"
-        login_display = "block" if auth_mode == "login" else "none"
-
-        m_ig_active = "active" if reg_method == "instagram" else ""
-        m_em_active = "active" if reg_method == "email" else ""
-        ig_field_disp = "block" if reg_method == "instagram" else "none"
-        em_field_disp = "block" if reg_method == "email" else "none"
-        ig_req_attr = "required" if reg_method == "instagram" else ""
-        em_req_attr = "required" if reg_method == "email" else ""
-
-        client_auth_section = f"""
-        <div class="card-3d auth-gate-card" id="clientAuthGate">
-          <h2>🔐 Regjistrohu për të Bërë Rezervim</h2>
-          <p style="margin:0 0 8px; font-size:0.86rem; color:var(--muted); line-height:1.4;">
-            Rezervimi nuk lejohet pa regjistrim. Zgjidhni variantin me <b>Instagram</b> (pa email) ose me <b>Email</b> (pa Instagram), plus <b>telefonin</b> dhe <b>password-in</b>.
-          </p>
-
-          <div class="auth-mode-switch">
-            <button type="button" id="btnAuthRegister" class="auth-mode-btn {reg_active}" onclick="setAuthMode('register')">
-              ✍️ Regjistrim i Ri
-            </button>
-            <button type="button" id="btnAuthLogin" class="auth-mode-btn {login_active}" onclick="setAuthMode('login')">
-              🔑 Kam Llogari (Kyçu)
-            </button>
-          </div>
-
-          <form method="POST" id="clientRegisterForm" style="display:{reg_display};">
-            <input type="hidden" name="form_type" value="client_register">
-            <input type="hidden" name="reg_method" id="reg_method" value="{reg_method}">
+            <input type="hidden" name="post_mode" value="client_auth">
             <input type="hidden" name="active_tab" value="book">
 
-            <label>Zgjidh Variantën e Regjistrimit *</label>
-            <div class="method-choice-row">
-              <button type="button" id="chipMethodIg" class="method-chip {m_ig_active}" onclick="setRegMethod('instagram')">
-                📸 Me Instagram
-              </button>
-              <button type="button" id="chipMethodEmail" class="method-chip {m_em_active}" onclick="setRegMethod('email')">
-                ✉️ Me Email
-              </button>
-            </div>
+            <label for="auth_contact">Email ose Instagram</label>
+            <input type="text" name="auth_contact" id="auth_contact" placeholder="p.sh. sara@email.com ose @sara.beauty" required>
 
-            <div id="boxRegInstagram" style="display:{ig_field_disp};">
-              <label for="reg_instagram">Llogaria e Instagramit *</label>
-              <input type="text" name="reg_instagram" id="reg_instagram" autocomplete="username" autocapitalize="none" autocorrect="off" placeholder="p.sh. @sara.berisha" {ig_req_attr}>
-              <div class="ig-autofill-row">
-                <span id="igAutofillHint">Mbushja automatike aktivizohet kur prekni Me Instagram.</span>
-                <button type="button" class="ig-mini-btn" onclick="syncInstagramFromDevice()">📲 Merr nga IG</button>
+            <label for="auth_password">Password</label>
+            <input type="password" name="auth_password" id="auth_password" placeholder="Shkruani passwordin..." required>
+
+            <div class="row-2">
+              <div>
+                <label for="auth_full_name">Emri (opsionale)</label>
+                <input type="text" name="auth_full_name" id="auth_full_name" placeholder="p.sh. Sara Berisha">
+              </div>
+              <div>
+                <label for="auth_phone">Telefoni (opsionale)</label>
+                <input type="tel" name="auth_phone" id="auth_phone" placeholder="+383 44 ...">
               </div>
             </div>
 
-            <div id="boxRegEmail" style="display:{em_field_disp};">
-              <label for="reg_email">Adresa e Emailit *</label>
-              <input type="email" name="reg_email" id="reg_email" autocomplete="email" placeholder="p.sh. sara@email.com" {em_req_attr}>
-            </div>
-
-            <label for="reg_phone">Numri i Telefonit *</label>
-            <input type="tel" name="reg_phone" id="reg_phone" autocomplete="tel" placeholder="p.sh. +383 44 123 456" required>
-
-            <label for="reg_password">Fjalëkalimi (Password) *</label>
-            <input type="password" name="reg_password" id="reg_password" autocomplete="new-password" minlength="6" placeholder="Minimumi 6 karaktere" required>
-
-            <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px;">
-              ✅ Regjistrohu &amp; Zhblloko Rezervimin
-            </button>
-          </form>
-
-          <form method="POST" id="clientLoginForm" style="display:{login_display};">
-            <input type="hidden" name="form_type" value="client_login">
-            <input type="hidden" name="active_tab" value="book">
-
-            <label for="login_identifier">Instagrami ose Emaili *</label>
-            <input type="text" name="login_identifier" id="login_identifier" autocomplete="username" placeholder="@llogaria_ig ose email@shembull.com" required>
-
-            <label for="login_password">Fjalëkalimi (Password) *</label>
-            <input type="password" name="login_password" id="login_password" autocomplete="current-password" required>
-
-            <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px;">
-              🔓 Kyçu për të Rezervuar
+            <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:11px; padding:9px 12px; font-size:0.84rem;">
+              Kyçu / Regjistrohu
             </button>
           </form>
         </div>
         """
-        booking_form_lock_note = """
-        <div class="alert alert-err" style="margin-bottom:8px;">
-          ⛔ Rezervimi është i bllokuar derisa të regjistroheni (me Instagram ose Email) + telefon + password.
-        </div>
-        """
-        booking_disabled_attr = "disabled"
 
-    prefill_name = (logged_client["instagram"] or logged_client["email"]) if logged_client else ""
-    prefill_phone = logged_client["phone"] if logged_client else ""
+    w_start = settings.get("work_start") or WORK_START
+    w_end = settings.get("work_end") or WORK_END
+    hygiene_note = settings.get("hygiene_note") or "Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje."
 
     inner = f"""
-      <div id="liveToastBanner" class="live-toast-banner">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-          <b id="liveToastTitle" style="font-size:1.02rem;">🔔 NJOFTIM — GRANDE STUDIO</b>
-          <button type="button" onclick="document.getElementById('liveToastBanner').style.display='none'" style="background:none; border:none; color:#fff; font-weight:900; font-size:1.15rem; cursor:pointer;">✕</button>
-        </div>
-        <div id="liveToastBody" style="font-size:0.88rem; margin-top:6px; line-height:1.45;"></div>
-        <button type="button" onclick="window.location.reload()" style="margin-top:9px; width:100%; background:#fff; color:#be123c; border:none; border-radius:9px; padding:7px; font-weight:800; cursor:pointer;">
-          🔄 Rifresko Tani
-        </button>
-      </div>
+      {new_password_modal_html}
 
       <div id="installGuideModal" style="display:none; position:fixed; inset:0; background:rgba(20,4,8,0.72); z-index:9998; align-items:center; justify-content:center; padding:16px;">
         <div style="background:#fff; color:#261217; border-radius:18px; padding:16px; max-width:350px; width:100%; box-shadow:0 16px 40px rgba(0,0,0,0.45); border:1.5px solid #edd3da;">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-            <b style="color:#72091d; font-size:1.02rem;" id="installModalTitle">📲 Instalo Grande Studio</b>
-            <button type="button" onclick="closeInstallModal()" style="background:none; border:none; font-size:1.15rem; font-weight:800; color:#72091d; cursor:pointer;">✕</button>
+            <b style="color:#72091d; font-size:0.95rem;" id="installModalTitle">📲 Instalo Grande Studio</b>
+            <button type="button" data-no-auto-refresh onclick="closeInstallModal()" style="background:none; border:none; font-size:1.1rem; font-weight:800; color:#72091d; cursor:pointer;">✕</button>
           </div>
-          <div id="installModalBody" style="font-size:0.88rem; line-height:1.55; background:#fdf5f7; padding:10px; border-radius:12px; border:1px solid #edd3da;"></div>
-          <button type="button" onclick="closeInstallModal()" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px; padding:9px;">
+          <div id="installModalBody" style="font-size:0.8rem; line-height:1.55; background:#fdf5f7; padding:10px; border-radius:12px; border:1px solid #edd3da;"></div>
+          <button type="button" data-no-auto-refresh onclick="closeInstallModal()" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px; padding:9px;">
             E kuptova
           </button>
         </div>
@@ -2340,14 +2165,13 @@ def index():
 
       <div class="container">
         {alert_html}
-        {client_notifs_html}
 
         <div class="install-prompt-box" id="pwaInstallBanner" style="display:flex;">
-          <div style="font-size:0.84rem; color:var(--vishnje-dark); line-height:1.35;">
+          <div style="font-size:0.76rem; color:var(--vishnje-dark); line-height:1.3;">
             <b>📲 Instalo Grande Studio</b><br>
             Shtoje në ekranin kryesor (Wi-Fi ose 5G)!
           </div>
-          <button type="button" id="pwaInstallBtn" class="btn-3d btn-vishnje-3d" style="padding:7px 11px; font-size:0.82rem; white-space:nowrap;">
+          <button type="button" id="pwaInstallBtn" data-no-auto-refresh class="btn-3d btn-vishnje-3d" style="padding:7px 11px; font-size:0.75rem; white-space:nowrap;">
             Instalo Tani
           </button>
         </div>
@@ -2370,9 +2194,6 @@ def index():
           <button type="button" class="tab-btn {'active' if active_tab == 'book' else ''}" data-tab="book" onclick="switchTab('book')">
             📅 Rezervo Termin
           </button>
-          <button type="button" class="tab-btn {'active' if active_tab == 'beauty' else ''}" data-tab="beauty" onclick="switchTab('beauty')">
-            💅 Katalogu &amp; Artikujt
-          </button>
           <button type="button" class="tab-btn {'active' if active_tab == 'install' else ''}" data-tab="install" onclick="switchTab('install')">
             📱 iPhone &amp; Samsung
           </button>
@@ -2382,11 +2203,10 @@ def index():
         </div>
 
         <div id="tab-book" class="tab-panel {'active' if active_tab == 'book' else ''}">
-          {client_auth_section}
+          {client_login_card}
 
-          <div class="card-3d" id="bookingCardBox" style="{'opacity:0.65;' if not logged_client else ''}">
+          <div class="card-3d">
             <h2>Rezervo Terminin Tënd</h2>
-            {booking_form_lock_note}
 
             <label>Filtro sipas Zonës</label>
             <div class="cat-filter-row" id="categoryFilterRow">
@@ -2398,16 +2218,16 @@ def index():
             </div>
 
             <form method="POST" id="bookingForm">
-              <input type="hidden" name="form_type" value="booking">
+              <input type="hidden" name="post_mode" value="booking">
               <input type="hidden" name="active_tab" value="book">
 
-              <label for="service_id">1. Zgjidh Artikullin / Paketën</label>
-              <select name="service_id" id="service_id" {booking_disabled_attr} required>
+              <label for="service_id">1. Zgjidh Shërbimin / Paketën</label>
+              <select name="service_id" id="service_id" required>
                 {service_options}
               </select>
 
               <label for="appt_date">2. Zgjidh Datën</label>
-              <input type="date" name="appt_date" id="appt_date" value="{today_str}" min="{today_str}" {booking_disabled_attr} required>
+              <input type="date" name="appt_date" id="appt_date" value="{today_str}" min="{today_str}" required>
 
               <label>3. Zgjidh Orarin e Lirë</label>
               <div id="slotsContainer" class="slots">Duke ngarkuar oraret...</div>
@@ -2415,39 +2235,22 @@ def index():
 
               <div class="row-2">
                 <div>
-                  <label for="client_name">Emri / Llogaria</label>
-                  <input type="text" name="client_name" id="client_name" value="{prefill_name}" placeholder="p.sh. Sara Berisha" {booking_disabled_attr} required>
+                  <label for="client_contact">Email ose Instagram</label>
+                  <input type="text" name="client_contact" id="client_contact" value="{saved_client_contact}" placeholder="p.sh. sara@email.com ose @sara.beauty" required>
                 </div>
                 <div>
                   <label for="client_phone">Numri i Telefonit</label>
-                  <input type="tel" name="client_phone" id="client_phone" value="{prefill_phone}" readonly>
+                  <input type="tel" name="client_phone" id="client_phone" value="{saved_client_phone}" placeholder="p.sh. +383 44 ..." required>
                 </div>
               </div>
 
               <label for="notes">Detaje për Thonj, Qerpikë ose Vetulla</label>
-              <textarea name="notes" id="notes" rows="2" placeholder="p.sh. thonj mandorle vishnje, lash lift, laminim vetullash..." {booking_disabled_attr}></textarea>
+              <textarea name="notes" id="notes" rows="2" placeholder="p.sh. thonj mandorle vishnje, lash lift, laminim vetullash..."></textarea>
 
-              <button type="submit" id="confirmBookingBtn" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:14px;" {booking_disabled_attr}>
+              <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:14px;">
                 ✨ Konfirmo Terminin
               </button>
             </form>
-          </div>
-        </div>
-
-        <div id="tab-beauty" class="tab-panel {'active' if active_tab == 'beauty' else ''}">
-          <div class="card-3d">
-            <h2>Artikujt: Thonj, Qerpikë &amp; Vetulla</h2>
-            <div class="cat-filter-row" id="catalogFilterRow">
-              <button type="button" class="cat-chip-3d active" data-bcat="ALL" onclick="filterCatalog('ALL')">Të gjitha</button>
-              <button type="button" class="cat-chip-3d" data-bcat="Kombinim" onclick="filterCatalog('Kombinim')">Kombinime</button>
-              <button type="button" class="cat-chip-3d" data-bcat="Thonj" onclick="filterCatalog('Thonj')">Thonj</button>
-              <button type="button" class="cat-chip-3d" data-bcat="Qerpikë" onclick="filterCatalog('Qerpikë')">Qerpikë</button>
-              <button type="button" class="cat-chip-3d" data-bcat="Vetulla" onclick="filterCatalog('Vetulla')">Vetulla</button>
-            </div>
-
-            <div class="svc-grid" id="beautyCardsGrid">
-              {beauty_cards_html}
-            </div>
           </div>
         </div>
 
@@ -2484,9 +2287,9 @@ def index():
         <div id="tab-info" class="tab-panel {'active' if active_tab == 'info' else ''}">
           <div class="card-3d">
             <h2>Orari &amp; Standardet — Grande Studio</h2>
-            <p style="margin:0; color:var(--muted); font-size:0.92rem; line-height:1.55;">
-              • <b>Orari i rezervimeve:</b> {WORK_START} – {WORK_END} (llogaritja e kohëzgjatjes bëhet automatikisht).<br>
-              • <b>Higjiena &amp; Sterilizimi:</b> Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.<br>
+            <p style="margin:0; color:var(--muted); font-size:0.84rem; line-height:1.55;">
+              • <b>Orari i rezervimeve:</b> {w_start} – {w_end} (llogaritja e kohëzgjatjes bëhet automatikisht).<br>
+              • <b>Higjiena &amp; Sterilizimi:</b> {hygiene_note}<br>
               • <b>Instagram:</b> <a href="{IG_WEB_URL}" data-ig-app="{IG_APP_URL}" data-ig-web="{IG_WEB_URL}" onclick="openInstagramProfile(event)" style="color:var(--vishnje);font-weight:700;">@{IG_USERNAME}</a>
             </p>
           </div>
@@ -2494,242 +2297,6 @@ def index():
       </div>
 
       <script>
-        const IS_CLIENT_LOGGED_IN = {'true' if logged_client else 'false'};
-
-        if ('serviceWorker' in navigator) {{
-          navigator.serviceWorker.addEventListener('message', (event) => {{
-            if (event.data && event.data.type === 'PLAY_CHIME') {{
-              playNotificationChime();
-            }}
-          }});
-        }}
-
-        async function enableClientNotifications() {{
-          const statusEl = document.getElementById('clientPushStatus');
-          playNotificationChime();
-
-          if (!('Notification' in window)) {{
-            if (statusEl) statusEl.textContent = '⚠️ Për iPhone: Shtypni Share -> Add to Home Screen fillimisht!';
-            return;
-          }}
-
-          const perm = await Notification.requestPermission();
-          if (perm !== 'granted') {{
-            if (statusEl) statusEl.textContent = '❌ Leja për njoftime u refuzua në cilësimet e telefonit.';
-            return;
-          }}
-
-          if (statusEl) statusEl.textContent = '✅ Zëri u aktivizua!';
-
-          if ('serviceWorker' in navigator && 'PushManager' in window && IS_CLIENT_LOGGED_IN) {{
-            try {{
-              const reg = await navigator.serviceWorker.ready;
-              const keyRes = await fetch('/api/push/public-key');
-              const keyData = await keyRes.json();
-              if (keyData.publicKey) {{
-                const sub = await reg.pushManager.subscribe({{
-                  userVisibleOnly: true,
-                  applicationServerKey: urlBase64ToUint8Array(keyData.publicKey)
-                }});
-                await fetch('/api/client/push/subscribe', {{
-                  method: 'POST',
-                  headers: {{ 'Content-Type': 'application/json' }},
-                  body: JSON.stringify(sub)
-                }});
-                if (statusEl) statusEl.textContent = '✅ Njoftimet me zë u aktivizuan edhe kur aplikacioni është i mbyllur!';
-              }}
-            }} catch (err) {{}}
-          }}
-        }}
-
-        let seenClientNotifIds = new Set();
-        async function pollClientNotifications() {{
-          if (!IS_CLIENT_LOGGED_IN) return;
-          try {{
-            const res = await fetch('/api/client/notifications');
-            if (!res.ok) return;
-            const data = await res.json();
-            if (data.blocked) {{
-              window.location.reload();
-              return;
-            }}
-            const list = data.notifications || [];
-            if (!seenClientNotifIds.size) {{
-              list.forEach(item => seenClientNotifIds.add(item.id));
-              return;
-            }}
-            const unreadNew = list.filter(item => item.is_read === 0 && !seenClientNotifIds.has(item.id));
-            if (unreadNew.length > 0) {{
-              unreadNew.forEach(item => seenClientNotifIds.add(item.id));
-              const latest = unreadNew[0];
-              playNotificationChime();
-              if (navigator.vibrate) navigator.vibrate([300, 150, 300]);
-              const toast = document.getElementById('liveToastBanner');
-              const toastTitle = document.getElementById('liveToastTitle');
-              const toastBody = document.getElementById('liveToastBody');
-              if (toast && toastTitle && toastBody) {{
-                toastTitle.textContent = latest.title || '🔔 NJOFTIM — GRANDE STUDIO';
-                toastBody.textContent = latest.body;
-                toast.style.display = 'block';
-              }}
-              await fetch('/api/client/notifications/read', {{ method: 'POST' }});
-            }}
-          }} catch (e) {{}}
-        }}
-
-        if (IS_CLIENT_LOGGED_IN) {{
-          pollClientNotifications();
-          setInterval(pollClientNotifications, 5000);
-        }}
-
-        function formatIgUsername(raw) {{
-          if (!raw) return '';
-          let s = String(raw).trim();
-          const matchUrl = s.match(/instagram\\.com\\/([^/?#&]+)/i);
-          if (matchUrl && matchUrl[1]) s = matchUrl[1];
-          s = s.replace(/^@+/, '').trim();
-          if (!s || s.includes(' ') || s.length > 35) return '';
-          return '@' + s.toLowerCase();
-        }}
-
-        function saveDetectedInstagram(val) {{
-          const formatted = formatIgUsername(val);
-          if (!formatted) return '';
-          try {{ localStorage.setItem('grande_studio_ig_user', formatted); }} catch (e) {{}}
-          return formatted;
-        }}
-
-        function getStoredInstagram() {{
-          try {{
-            const params = new URLSearchParams(window.location.search);
-            const fromQuery = formatIgUsername(params.get('ig') || params.get('instagram') || params.get('username') || '');
-            if (fromQuery) {{
-              saveDetectedInstagram(fromQuery);
-              return fromQuery;
-            }}
-            const saved = formatIgUsername(localStorage.getItem('grande_studio_ig_user') || '');
-            if (saved) return saved;
-          }} catch (e) {{}}
-          return '';
-        }}
-
-        async function autofillInstagramField(fromReturnAfterIgApp) {{
-          const inpIg = document.getElementById('reg_instagram');
-          const hintEl = document.getElementById('igAutofillHint');
-          if (!inpIg) return;
-
-          const stored = getStoredInstagram();
-          if (stored) {{
-            inpIg.value = stored;
-            if (hintEl) hintEl.textContent = 'U plotësua automatikisht (' + stored + '). Plotëso vetëm telefonin & password-in.';
-            return;
-          }}
-
-          if (fromReturnAfterIgApp && navigator.clipboard && navigator.clipboard.readText) {{
-            try {{
-              const clipText = await navigator.clipboard.readText();
-              const clipIg = formatIgUsername(clipText);
-              if (clipIg) {{
-                inpIg.value = clipIg;
-                saveDetectedInstagram(clipIg);
-                if (hintEl) hintEl.textContent = 'U plotësua automatikisht (' + clipIg + '). Plotëso vetëm telefonin & password-in.';
-                return;
-              }}
-            }} catch (e) {{}}
-          }}
-
-          if (hintEl) {{
-            hintEl.textContent = 'Nëse nuk plotësohet vetë, preke fushën për autofill ose "Merr nga IG".';
-          }}
-        }}
-
-        function syncInstagramFromDevice() {{
-          const inpIg = document.getElementById('reg_instagram');
-          if (inpIg && inpIg.value.trim()) {{
-            const saved = saveDetectedInstagram(inpIg.value);
-            if (saved) {{
-              inpIg.value = saved;
-              autofillInstagramField(false);
-              return;
-            }}
-          }}
-          try {{
-            sessionStorage.setItem('grande_ig_sync_pending', '1');
-            window.location.href = 'instagram://app';
-          }} catch (e) {{}}
-          setTimeout(() => autofillInstagramField(true), 800);
-        }}
-
-        document.addEventListener('visibilitychange', () => {{
-          if (!document.hidden) {{
-            try {{
-              if (sessionStorage.getItem('grande_ig_sync_pending') === '1') {{
-                sessionStorage.removeItem('grande_ig_sync_pending');
-                autofillInstagramField(true);
-              }}
-            }} catch (e) {{}}
-          }}
-        }});
-
-        function setAuthMode(mode) {{
-          const regForm = document.getElementById('clientRegisterForm');
-          const loginForm = document.getElementById('clientLoginForm');
-          const btnReg = document.getElementById('btnAuthRegister');
-          const btnLog = document.getElementById('btnAuthLogin');
-          if (!regForm || !loginForm) return;
-          if (mode === 'login') {{
-            regForm.style.display = 'none';
-            loginForm.style.display = 'block';
-            btnReg.classList.remove('active');
-            btnLog.classList.add('active');
-          }} else {{
-            regForm.style.display = 'block';
-            loginForm.style.display = 'none';
-            btnReg.classList.add('active');
-            btnLog.classList.remove('active');
-          }}
-        }}
-
-        function setRegMethod(method) {{
-          const methodInput = document.getElementById('reg_method');
-          const chipIg = document.getElementById('chipMethodIg');
-          const chipEm = document.getElementById('chipMethodEmail');
-          const boxIg = document.getElementById('boxRegInstagram');
-          const boxEm = document.getElementById('boxRegEmail');
-          const inpIg = document.getElementById('reg_instagram');
-          const inpEm = document.getElementById('reg_email');
-          if (!methodInput) return;
-
-          if (method === 'email') {{
-            methodInput.value = 'email';
-            chipEm.classList.add('active');
-            chipIg.classList.remove('active');
-            boxEm.style.display = 'block';
-            boxIg.style.display = 'none';
-            inpEm.required = true;
-            inpIg.required = false;
-            inpIg.value = '';
-          }} else {{
-            methodInput.value = 'instagram';
-            chipIg.classList.add('active');
-            chipEm.classList.remove('active');
-            boxIg.style.display = 'block';
-            boxEm.style.display = 'none';
-            inpIg.required = true;
-            inpEm.required = false;
-            inpEm.value = '';
-            autofillInstagramField(false);
-          }}
-        }}
-
-        const regIgInput = document.getElementById('reg_instagram');
-        if (regIgInput) {{
-          regIgInput.addEventListener('change', () => {{
-            const f = saveDetectedInstagram(regIgInput.value);
-            if (f) regIgInput.value = f;
-          }});
-        }}
-
         let deferredPrompt = null;
         const installBanner = document.getElementById('pwaInstallBanner');
         const installBtn = document.getElementById('pwaInstallBtn');
@@ -2792,6 +2359,7 @@ def index():
         }}
 
         function switchTab(tabName) {{
+          try {{ localStorage.setItem('grande_studio_client_tab', tabName); }} catch (e) {{}}
           document.querySelectorAll('.tab-btn').forEach(btn => {{
             btn.classList.toggle('active', btn.getAttribute('data-tab') === tabName);
           }});
@@ -2810,18 +2378,6 @@ def index():
           text: opt.text
         }}));
 
-        function enforceBookingLockState() {{
-          if (IS_CLIENT_LOGGED_IN) return;
-          svcEl.disabled = true;
-          dateEl.disabled = true;
-          const cname = document.getElementById('client_name');
-          const cnotes = document.getElementById('notes');
-          const cbtn = document.getElementById('confirmBookingBtn');
-          if (cname) cname.disabled = true;
-          if (cnotes) cnotes.disabled = true;
-          if (cbtn) cbtn.disabled = true;
-        }}
-
         function filterServicesByCat(cat) {{
           document.querySelectorAll('#categoryFilterRow .cat-chip-3d').forEach(b => {{
             b.classList.toggle('active', b.getAttribute('data-cat') === cat);
@@ -2838,38 +2394,19 @@ def index():
           loadSlots();
         }}
 
-        function filterCatalog(cat) {{
-          document.querySelectorAll('#catalogFilterRow .cat-chip-3d').forEach(b => {{
-            b.classList.toggle('active', b.getAttribute('data-bcat') === cat);
-          }});
-          document.querySelectorAll('#beautyCardsGrid .svc-card-3d').forEach(card => {{
-            const cardCat = card.getAttribute('data-cat-card');
-            card.style.display = (cat === 'ALL' || cardCat === cat) ? 'flex' : 'none';
-          }});
-        }}
-
-        function selectServiceAndBook(serviceId) {{
-          filterServicesByCat('ALL');
-          svcEl.value = String(serviceId);
-          switchTab('book');
-          loadSlots();
-          const scroller = document.getElementById('iphoneScrollArea');
-          if (scroller) scroller.scrollTo({{ top: 0, behavior: 'smooth' }});
-        }}
-
         async function loadSlots() {{
           startInput.value = '';
           if (!svcEl.value) {{
-            slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.86rem;">Nuk ka artikull të zgjedhur.</span>';
+            slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Nuk ka shërbim të zgjedhur.</span>';
             return;
           }}
-          slotsEl.innerHTML = '<span style="color:#6e4e57;font-size:0.86rem;">Po kontrollohen oraret e lira...</span>';
+          slotsEl.innerHTML = '<span style="color:#6e4e57;font-size:0.82rem;">Po kontrollohen oraret e lira...</span>';
           const res = await fetch(`/api/slots?date=${{encodeURIComponent(dateEl.value)}}&service_id=${{encodeURIComponent(svcEl.value)}}`);
           const data = await res.json();
           slotsEl.innerHTML = '';
 
           if (!data.slots || data.slots.length === 0) {{
-            slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.86rem;">Nuk ka orare të lira për këtë datë dhe kohëzgjatje.</span>';
+            slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Nuk ka orare të lira për këtë datë dhe kohëzgjatje.</span>';
             return;
           }}
 
@@ -2877,16 +2414,9 @@ def index():
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'slot-3d';
+            btn.setAttribute('data-no-auto-refresh', '1');
             btn.textContent = slot;
-            if (!IS_CLIENT_LOGGED_IN) {{
-              btn.disabled = true;
-              btn.style.opacity = '0.55';
-            }}
             btn.onclick = () => {{
-              if (!IS_CLIENT_LOGGED_IN) {{
-                alert('Ju lutem regjistrohuni ose kyçuni para se të bëni rezervim!');
-                return;
-              }}
               document.querySelectorAll('.slot-3d').forEach(b => b.classList.remove('active'));
               btn.classList.add('active');
               startInput.value = slot;
@@ -2898,30 +2428,24 @@ def index():
         svcEl.addEventListener('change', loadSlots);
         dateEl.addEventListener('change', loadSlots);
         document.getElementById('bookingForm').addEventListener('submit', (e) => {{
-          if (!IS_CLIENT_LOGGED_IN) {{
-            e.preventDefault();
-            alert('Ju lutem regjistrohuni ose kyçuni para se të bëni rezervim!');
-            return;
-          }}
           if (!startInput.value) {{
             e.preventDefault();
             alert('Ju lutem zgjidhni një orar të lirë!');
           }}
         }});
 
-        enforceBookingLockState();
         loadSlots();
       </script>
     """
-    html_out = render_iphone_shell("Grande Studio — Thonj, Qerpikë & Vetulla", inner)
-    resp = Response(html_out, mimetype="text/html")
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    return resp
+    return render_iphone_shell("Grande Studio — Thonj, Qerpikë & Vetulla", inner, role_tag=role_tag)
 
 
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     init_db()
+    if session.get("admin_logged_in"):
+        return redirect(url_for("admin_panel"))
+
     acc = get_admin_account()
     ig_nav_html = get_ig_nav_button_html()
     err = None
@@ -2952,10 +2476,11 @@ def admin_login():
                 conn.commit()
                 conn.close()
                 session.clear()
+                session.permanent = True
                 session["admin_logged_in"] = True
                 return redirect(url_for("admin_panel"))
 
-        alert_html = f'<div class="alert alert-err">{err}</div>' if err else ""
+        alert_html = f'<div class="alert alert-err"><span>{err}</span><button type="button" class="dismiss-btn" data-no-auto-refresh onclick="this.parentElement.remove()">Hiq ✕</button></div>' if err else ""
         inner = f"""
           <header>
             <div class="header-inner">
@@ -2975,7 +2500,7 @@ def admin_login():
             {alert_html}
             <div class="card-3d">
               <h2>Regjistrimi i Pronarit (Admin)</h2>
-              <p style="margin:0 0 10px; font-size:0.88rem; color:var(--muted); line-height:1.4;">
+              <p style="margin:0 0 10px; font-size:0.8rem; color:var(--muted); line-height:1.4;">
                 Regjistroni emailin dhe fjalëkalimin tuaj. Emaili shërben që në rast harrese të fjalëkalimit, resetimi të dërgohet direkt në emailin tuaj.
               </p>
               <form method="POST">
@@ -2995,7 +2520,7 @@ def admin_login():
             </div>
           </div>
         """
-        return render_iphone_shell("Regjistrim Admin — Grande Studio", inner)
+        return render_iphone_shell("Regjistrim Admin — Grande Studio", inner, role_tag="admin_login")
 
     if request.method == "POST":
         locked, wait_sec = is_login_locked(client_ip)
@@ -3007,12 +2532,13 @@ def admin_login():
             if email_in == acc["email"].strip().lower() and check_password_hash(acc["password_hash"], pwd_in):
                 clear_failed_login(client_ip)
                 session.clear()
+                session.permanent = True
                 session["admin_logged_in"] = True
                 return redirect(url_for("admin_panel"))
             record_failed_login(client_ip)
             err = "Emaili ose fjalëkalimi është i pasaktë."
 
-    err_html = f'<div class="alert alert-err">{err}</div>' if err else ""
+    err_html = f'<div class="alert alert-err"><span>{err}</span><button type="button" class="dismiss-btn" data-no-auto-refresh onclick="this.parentElement.remove()">Hiq ✕</button></div>' if err else ""
 
     inner = f"""
       <header>
@@ -3048,7 +2574,7 @@ def admin_login():
         </div>
       </div>
     """
-    return render_iphone_shell("Hyrja Admin — Grande Studio", inner)
+    return render_iphone_shell("Hyrja Admin — Grande Studio", inner, role_tag="admin_login")
 
 
 @app.route("/admin/reset-password", methods=["GET", "POST"])
@@ -3086,7 +2612,7 @@ def admin_reset_password():
     alert_html = ""
     if msg:
         cls = "alert-ok" if msg_type == "ok" else "alert-err"
-        alert_html = f'<div class="alert {cls}">{msg}</div>'
+        alert_html = f'<div class="alert {cls}"><span>{msg}</span><button type="button" class="dismiss-btn" data-no-auto-refresh onclick="this.parentElement.remove()">Hiq ✕</button></div>'
 
     inner = f"""
       <header>
@@ -3108,7 +2634,7 @@ def admin_reset_password():
         {alert_html}
         <div class="card-3d">
           <h2>Reset Password në Email</h2>
-          <p style="margin:0 0 10px; font-size:0.88rem; color:var(--muted); line-height:1.4;">
+          <p style="margin:0 0 10px; font-size:0.8rem; color:var(--muted); line-height:1.4;">
             Shkruani emailin që keni regjistruar si pronar. Fjalëkalimi i ri do të gjenerohet dhe do të dërgohet në atë email.
           </p>
           <form method="POST">
@@ -3121,7 +2647,7 @@ def admin_reset_password():
         </div>
       </div>
     """
-    return render_iphone_shell("Reset Password — Grande Studio", inner)
+    return render_iphone_shell("Reset Password — Grande Studio", inner, role_tag="reset")
 
 
 @app.route("/admin/logout")
@@ -3136,84 +2662,57 @@ def admin_panel():
     init_db()
     acc = get_admin_account()
     ig_nav_html = get_ig_nav_button_html()
+    settings = get_salon_settings()
     conn = get_db()
     cur = conn.cursor()
     today_str = datetime.now().strftime("%Y-%m-%d")
     feedback_msg = None
     feedback_type = "ok"
-    show_clients_panel = request.form.get("show_clients") == "1"
+    external_reset_link = ""
+    external_reset_label = ""
+    show_clients_modal = False
 
     if request.method == "POST":
         action = request.form.get("action")
 
-        if action == "toggle_block_client":
-            show_clients_panel = True
-            cid = request.form.get("client_id", type=int)
-            if cid:
-                cur.execute("SELECT is_blocked FROM client_accounts WHERE id = ?", (cid,))
-                crow = cur.fetchone()
-                if crow:
-                    next_blk = 0 if crow["is_blocked"] == 1 else 1
-                    cur.execute("UPDATE client_accounts SET is_blocked = ? WHERE id = ?", (next_blk, cid))
-                    conn.commit()
-                    feedback_msg = "Klientja u bllokua." if next_blk == 1 else "Klientja u zhbllokua."
-                    feedback_type = "ok"
-
-        elif action == "delete_client":
-            show_clients_panel = True
-            cid = request.form.get("client_id", type=int)
-            if cid:
-                cur.execute("DELETE FROM client_accounts WHERE id = ?", (cid,))
-                conn.commit()
-                feedback_msg = "Llogaria e klientes u fshi me sukses."
-                feedback_type = "ok"
-
-        elif action == "reset_client_password":
-            show_clients_panel = True
-            cid = request.form.get("client_id", type=int)
-            if cid:
-                cur.execute("SELECT id FROM client_accounts WHERE id = ?", (cid,))
-                if cur.fetchone():
-                    cur.execute("UPDATE client_accounts SET password_reset_required = 1 WHERE id = ?", (cid,))
-                    conn.commit()
-                    notify_client_message(
-                        cid,
-                        "🔑 Reset Password — Grande Studio",
-                        MSG_RESET_PWD,
-                        event_type="reset_password"
+        if action == "refresh_client_password":
+            client_id = request.form.get("client_id", type=int)
+            show_clients_modal = True
+            if client_id:
+                cur.execute("SELECT * FROM clients WHERE id = ?", (client_id,))
+                cli = cur.fetchone()
+                if cli:
+                    token = secrets.token_urlsafe(16)
+                    channel_label, ext_url = send_client_password_reset_notification(
+                        cli,
+                        f"{request.url_root.rstrip('/')}/?reset_token={token}",
                     )
-                    feedback_msg = "U dërgua njoftimi te klientja për të futur password të ri."
+                    cur.execute(
+                        """
+                        UPDATE clients
+                        SET reset_pending = 1, reset_token = ?, reset_sent_via = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (token, channel_label, datetime.now().isoformat(), client_id),
+                    )
+                    conn.commit()
+                    external_reset_link = ext_url
+                    external_reset_label = channel_label
+                    feedback_msg = f"Njoftimi për rivendosjen e passwordit u dërgua te {channel_label}. Kur klienti ta hapë aplikacionin, do t'i shfaqet dritarja 'Shëno passwordin e ri'."
                     feedback_type = "ok"
 
         elif action == "mark_seen":
             appt_id = request.form.get("appt_id", type=int)
             if appt_id:
-                cur.execute("SELECT client_id FROM appointments WHERE id = ?", (appt_id,))
-                row_a = cur.fetchone()
-                c_id = row_a["client_id"] if row_a else None
-                cur.execute("UPDATE appointments SET is_new = 0, status = 'Konfirmuar' WHERE id = ?", (appt_id,))
+                cur.execute("UPDATE appointments SET is_new = 0 WHERE id = ?", (appt_id,))
                 conn.commit()
-                notify_client_appointment_decision(c_id, accepted=True)
-                feedback_msg = "Termini u konfirmua dhe klientes iu dërgua njoftimi me zë."
+                feedback_msg = "Njoftimi u hoq."
                 feedback_type = "ok"
 
         elif action == "mark_all_seen":
-            cur.execute("SELECT DISTINCT client_id FROM appointments WHERE is_new = 1 AND status = 'Konfirmuar' AND client_id IS NOT NULL")
-            c_rows = cur.fetchall()
             cur.execute("UPDATE appointments SET is_new = 0 WHERE is_new = 1")
             conn.commit()
-            for cr in c_rows:
-                notify_client_appointment_decision(cr["client_id"], accepted=True)
-            feedback_msg = "Të gjitha rezervimet e reja u konfirmuan dhe klientet u njoftuan."
-            feedback_type = "ok"
-
-        elif action == "test_push":
-            send_push_to_admins(
-                title="🔔 Test Njoftimi — Grande Studio",
-                body="Njoftimet me zë dhe vizuale po funksionojnë me sukses në telefonin tuaj!",
-                url="/admin"
-            )
-            feedback_msg = "Njoftimi testues u dërgua në telefon!"
+            feedback_msg = "Të gjitha njoftimet u hoqën."
             feedback_type = "ok"
 
         elif action == "change_password":
@@ -3237,7 +2736,7 @@ def admin_panel():
                 )
                 conn.commit()
                 acc = get_admin_account()
-                feedback_msg = "Fjalëkalimi u ndryshua dhe u ruajt me sukses."
+                feedback_msg = "Fjalëkalimi u ndryshua dhe u ruajt automatikisht."
                 feedback_type = "ok"
 
         elif action == "update_service":
@@ -3257,7 +2756,7 @@ def admin_panel():
                     (s_cat, s_name, s_dur, s_price, s_desc, svc_id),
                 )
                 conn.commit()
-                feedback_msg = f"Artikulli '{s_name}' u përditësua dhe u ruajt."
+                feedback_msg = f"Shërbimi '{s_name}' u ruajt automatikisht."
                 feedback_type = "ok"
 
         elif action == "add_service":
@@ -3272,7 +2771,7 @@ def admin_panel():
                     (s_cat, s_name, s_dur, s_price, s_desc),
                 )
                 conn.commit()
-                feedback_msg = f"Artikulli i ri '{s_name}' u shtua dhe u ruajt."
+                feedback_msg = f"Shërbimi i ri '{s_name}' u shtua dhe u ruajt."
                 feedback_type = "ok"
 
         elif action == "delete_service":
@@ -3280,7 +2779,7 @@ def admin_panel():
             if svc_id:
                 cur.execute("DELETE FROM services WHERE id = ?", (svc_id,))
                 conn.commit()
-                feedback_msg = "Artikulli u hoq me sukses."
+                feedback_msg = "Shërbimi u hoq."
                 feedback_type = "ok"
 
         elif action == "block_slot":
@@ -3300,38 +2799,28 @@ def admin_panel():
                 (b_reason, svc_id, b_date, b_start, b_end, "Orar i bllokuar", datetime.now().isoformat()),
             )
             conn.commit()
-            feedback_msg = "Orari u bllokua dhe u ruajt."
+            feedback_msg = "Orari u bllokua dhe u ruajt automatikisht."
             feedback_type = "ok"
 
         elif action == "set_status":
             appt_id = request.form.get("appt_id", type=int)
             new_status = request.form.get("status", "Konfirmuar")
             if appt_id and new_status in ("Konfirmuar", "Anuluar", "Bllokuar"):
-                cur.execute("SELECT client_id, status FROM appointments WHERE id = ?", (appt_id,))
-                row_a = cur.fetchone()
-                c_id = row_a["client_id"] if row_a else None
                 cur.execute("UPDATE appointments SET status = ?, is_new = 0 WHERE id = ?", (new_status, appt_id))
                 conn.commit()
-                if new_status == "Konfirmuar":
-                    notify_client_appointment_decision(c_id, accepted=True)
-                elif new_status == "Anuluar":
-                    notify_client_appointment_decision(c_id, accepted=False)
-                feedback_msg = "Statusi i terminit u përditësua dhe klientja u njoftua."
+                feedback_msg = "Statusi i terminit u ruajt automatikisht."
                 feedback_type = "ok"
 
         elif action == "delete_appt":
             appt_id = request.form.get("appt_id", type=int)
             if appt_id:
-                cur.execute("SELECT client_id, status FROM appointments WHERE id = ?", (appt_id,))
-                row_a = cur.fetchone()
-                c_id = row_a["client_id"] if row_a else None
-                st = row_a["status"] if row_a else ""
                 cur.execute("DELETE FROM appointments WHERE id = ?", (appt_id,))
                 conn.commit()
-                if st != "Bllokuar" and c_id:
-                    notify_client_appointment_decision(c_id, accepted=False)
-                feedback_msg = "Termini u fshi dhe klientes iu dërgua njoftimi."
+                feedback_msg = "Termini u fshi."
                 feedback_type = "ok"
+
+    cur.execute("SELECT * FROM clients ORDER BY id DESC")
+    registered_clients = cur.fetchall()
 
     cur.execute(
         """
@@ -3356,92 +2845,63 @@ def admin_panel():
 
     cur.execute("SELECT * FROM services ORDER BY id")
     services = cur.fetchall()
-
-    cur.execute("SELECT * FROM client_accounts ORDER BY id DESC")
-    registered_clients = cur.fetchall()
     conn.close()
 
-    clients_cards_html = ""
-    for cl in registered_clients:
-        ident = cl["instagram"] or cl["email"] or f"Kliente #{cl['id']}"
-        is_blk = cl["is_blocked"] == 1
-        needs_rst = cl["password_reset_required"] == 1
-        status_badges = []
-        if is_blk:
-            status_badges.append('<span class="badge b-blk">Bllokuar</span>')
-        else:
-            status_badges.append('<span class="badge b-ok">Aktive</span>')
-        if needs_rst:
-            status_badges.append('<span class="badge" style="background:#fef3c7;color:#92400e;">Reset Password aktiv</span>')
+    registered_clients_html = ""
+    if registered_clients:
+        for rc in registered_clients:
+            badge_channel = "📧 Email" if rc["contact_type"] == "email" else "📸 Instagram"
+            pending_badge = '<span class="badge-new-live" style="font-size:0.62rem; margin-left:5px;">Në pritje të passwordit të ri</span>' if rc["reset_pending"] == 1 else ""
+            phone_txt = f" • Tel: {rc['client_phone']}" if rc["client_phone"] else ""
+            name_txt = f" ({rc['full_name']})" if rc["full_name"] and rc["full_name"] != rc["contact_value"] else ""
+            registered_clients_html += f"""
+            <div class="client-list-item" data-no-auto-refresh onclick="selectRegisteredClient({rc['id']}, this)">
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <b style="font-size:0.84rem; color:var(--vishnje-dark);">{rc['contact_value']}{name_txt}</b>
+                <span class="svc-tag">{badge_channel}</span>
+              </div>
+              <div style="font-size:0.72rem; color:var(--muted); margin-top:3px;">
+                Regjistruar: {rc['created_at'][:10]}{phone_txt} {pending_badge}
+              </div>
+              <form method="POST" class="refresh-pwd-form" style="display:none; margin-top:8px;" onclick="event.stopPropagation();">
+                <input type="hidden" name="action" value="refresh_client_password">
+                <input type="hidden" name="client_id" value="{rc['id']}">
+                <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; padding:7px 10px; font-size:0.78rem;">
+                  🔄 Refresko Password
+                </button>
+              </form>
+            </div>
+            """
+    else:
+        registered_clients_html = '<p style="font-size:0.8rem; color:var(--muted);">Nuk ka ende klientë të regjistruar.</p>'
 
-        blk_btn_label = "Zhblloko" if is_blk else "Blloko"
-        blk_btn_cls = "btn-seen" if is_blk else "btn-del"
-
-        clients_cards_html += f"""
-        <div class="client-item-card">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
-            <b>{ident}</b>
-            <div>{" ".join(status_badges)}</div>
-          </div>
-          <div style="font-size:0.84rem; color:var(--muted); margin-top:3px;">
-            📞 {cl["phone"]} • <i>{cl["auth_method"]}</i>
-          </div>
-          <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;">
-            <form method="POST" style="display:inline;">
-              <input type="hidden" name="action" value="reset_client_password">
-              <input type="hidden" name="client_id" value="{cl['id']}">
-              <input type="hidden" name="show_clients" value="1">
-              <button type="submit" class="btn-sm-3d btn-reset">🔑 Reset Password</button>
-            </form>
-            <form method="POST" style="display:inline;">
-              <input type="hidden" name="action" value="toggle_block_client">
-              <input type="hidden" name="client_id" value="{cl['id']}">
-              <input type="hidden" name="show_clients" value="1">
-              <button type="submit" class="btn-sm-3d {blk_btn_cls}">🚫 {blk_btn_label}</button>
-            </form>
-            <form method="POST" style="display:inline;">
-              <input type="hidden" name="action" value="delete_client">
-              <input type="hidden" name="client_id" value="{cl['id']}">
-              <input type="hidden" name="show_clients" value="1">
-              <button type="submit" class="btn-sm-3d btn-del">🗑️ Fshi</button>
-            </form>
-          </div>
+    ext_link_banner = ""
+    if external_reset_link:
+        ext_link_banner = f"""
+        <div style="background:#fff0f4; border:1px solid #fda4af; border-radius:10px; padding:8px 10px; margin-bottom:10px; font-size:0.76rem;">
+          <b>Kanali: {external_reset_label}</b><br>
+          <a href="{external_reset_link}" target="_blank" rel="noopener noreferrer" style="color:#be123c; font-weight:800; text-decoration:underline;">
+            ↗ Hap direkt {external_reset_label} për t'ia dërguar klientit
+          </a>
         </div>
         """
-
-    clients_section_html = f"""
-    <div class="card-3d" id="registeredClientsBox">
-      <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
-        <h2 style="margin:0;">👥 Klientët e Regjistruar ({len(registered_clients)})</h2>
-        <button type="button" id="toggleClientsBtn" onclick="toggleClientsSection()" class="btn-3d btn-vishnje-3d" style="padding:7px 11px; font-size:0.82rem;">
-          {'Mbyll Listën' if show_clients_panel else 'Shiko Klientët'}
-        </button>
-      </div>
-      <div id="clientsListContainer" style="display:{'block' if show_clients_panel else 'none'}; margin-top:10px;">
-        {clients_cards_html if clients_cards_html else '<p style="font-size:0.88rem;color:var(--muted);">Nuk ka kliente të regjistruar ende.</p>'}
-      </div>
-    </div>
-    """
 
     new_bookings_section = ""
     if new_appts:
         cards = ""
         for na in new_appts:
-            notes_line = f"<div style='font-size:0.84rem; color:#881337; margin-top:4px;'>📝 <i>{na['notes']}</i></div>" if na["notes"] else ""
-            contact_part = na["client_instagram"] or na["client_email"] or ""
-            ig_line = f"<div style='font-size:0.86rem; color:#881337; margin-top:2px;'>🔗 <b>{contact_part}</b></div>" if contact_part else ""
+            notes_line = f"<div style='font-size:0.76rem; color:#881337; margin-top:4px;'>📝 <i>{na['notes']}</i></div>" if na["notes"] else ""
             cards += f"""
-            <div class="new-booking-card">
+            <div class="new-booking-card" id="newBookingCard_{na['id']}">
               <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                <span class="badge-new-live">🔔 REZERVIM I RI</span>
-                <span style="font-size:0.86rem; font-weight:800; color:#9f1239;">{na['appt_date']} • {na['start_time']} - {na['end_time']}</span>
+                <span class="badge-new-live">🔔 NJOFTIM I RI</span>
+                <span style="font-size:0.78rem; font-weight:800; color:#9f1239;">{na['appt_date']} • {na['start_time']} - {na['end_time']}</span>
               </div>
-              <div style="font-size:1.02rem; font-weight:800; color:#4c0519;">{na['client_name']}</div>
-              <div style="font-size:0.9rem; font-weight:700; color:#881337; margin-top:2px;">
+              <div style="font-size:0.95rem; font-weight:800; color:#4c0519;">{na['client_name']}</div>
+              <div style="font-size:0.82rem; font-weight:700; color:#881337; margin-top:2px;">
                 📞 <a href="tel:{na['client_phone']}" style="color:#be123c; text-decoration:underline;">{na['client_phone']}</a>
               </div>
-              {ig_line}
-              <div style="font-size:0.88rem; color:#261217; margin-top:4px;">
+              <div style="font-size:0.8rem; color:#261217; margin-top:4px;">
                 💅 <b>[{na['category'] or '-'}] {na['service_name'] or '-'}</b> ({na['price'] or 0:.0f}€)
               </div>
               {notes_line}
@@ -3449,15 +2909,9 @@ def admin_panel():
                 <form method="POST" style="flex:1;">
                   <input type="hidden" name="action" value="mark_seen">
                   <input type="hidden" name="appt_id" value="{na['id']}">
-                  <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; padding:7px; font-size:0.84rem;">
-                    ✓ Konfirmo Terminin
+                  <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; padding:7px; font-size:0.76rem;">
+                    Hiq Njoftimin ✕
                   </button>
-                </form>
-                <form method="POST">
-                  <input type="hidden" name="action" value="set_status">
-                  <input type="hidden" name="appt_id" value="{na['id']}">
-                  <input type="hidden" name="status" value="Anuluar">
-                  <button type="submit" class="btn-sm-3d btn-del" style="padding:8px 10px;">Anulo</button>
                 </form>
               </div>
             </div>
@@ -3466,10 +2920,10 @@ def admin_panel():
         new_bookings_section = f"""
         <div class="card-3d" style="border: 2px solid #e11d48; background: #fff8f9;">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-            <h2 style="margin:0; color:#be123c;">🚨 Rezervime të Reja ({len(new_appts)})</h2>
+            <h2 style="margin:0; color:#be123c;">🚨 Njoftime të Reja ({len(new_appts)})</h2>
             <form method="POST">
               <input type="hidden" name="action" value="mark_all_seen">
-              <button type="submit" class="btn-sm-3d btn-seen">Konfirmo të gjitha</button>
+              <button type="submit" class="btn-sm-3d btn-seen">Hiq të gjitha ✕</button>
             </form>
           </div>
           {cards}
@@ -3480,23 +2934,15 @@ def admin_panel():
     for a in appts:
         is_new = a["is_new"] == 1 and a["status"] == "Konfirmuar"
         row_cls = "row-is-new" if is_new else ""
-        new_tag = '<span class="badge-new-live" style="font-size:0.68rem; padding:1px 6px; margin-bottom:3px;">I RI</span><br>' if is_new else ""
+        new_tag = '<span class="badge-new-live" style="font-size:0.6rem; padding:1px 5px; margin-bottom:3px;">I RI</span><br>' if is_new else ""
         badge_cls = "b-ok" if a["status"] == "Konfirmuar" else ("b-blk" if a["status"] == "Bllokuar" else "b-can")
-        contact_val = a["client_instagram"] or a["client_email"] or ""
-        ig_sub = f"<br><span style='font-size:0.76rem;color:#72091d;'>{contact_val}</span>" if contact_val else ""
         rows_html += f"""
         <tr class="{row_cls}">
           <td>{new_tag}<b>{a["appt_date"]}</b><br>{a["start_time"]}-{a["end_time"]}</td>
-          <td><b>{a["client_name"]}</b><br><a href="tel:{a["client_phone"]}" style="color:#6e4e57; text-decoration:none;">{a["client_phone"]}</a>{ig_sub}</td>
+          <td><b>{a["client_name"]}</b><br><a href="tel:{a["client_phone"]}" style="color:#6e4e57; text-decoration:none;">{a["client_phone"]}</a></td>
           <td><span class="svc-tag">{a["category"] or "-"}</span><br><b>{a["service_name"] or "-"}</b></td>
           <td><span class="badge {badge_cls}">{a["status"]}</span></td>
           <td>
-            <form method="POST" style="display:inline;">
-              <input type="hidden" name="action" value="set_status">
-              <input type="hidden" name="appt_id" value="{a["id"]}">
-              <input type="hidden" name="status" value="Konfirmuar">
-              <button class="btn-sm-3d btn-seen" type="submit">Prano</button>
-            </form>
             <form method="POST" style="display:inline;">
               <input type="hidden" name="action" value="set_status">
               <input type="hidden" name="appt_id" value="{a["id"]}">
@@ -3520,7 +2966,7 @@ def admin_panel():
         sel_komb = "selected" if s["category"] == "Kombinim" else ""
         editable_services_html += f"""
         <div class="edit-svc-box">
-          <form method="POST">
+          <form method="POST" class="auto-save-form">
             <input type="hidden" name="action" value="update_service">
             <input type="hidden" name="svc_id" value="{s['id']}">
             <div class="row-2">
@@ -3538,22 +2984,17 @@ def admin_panel():
                 <input type="number" name="s_price" value="{s['price']:.2f}" min="0" step="0.5" required>
               </div>
             </div>
-            <label>Emri / Teksti i Artikullit</label>
+            <label>Emri i Shërbimit</label>
             <input type="text" name="s_name" value="{s['name']}" required>
             <label>Kohëzgjatja (minuta)</label>
             <input type="number" name="s_dur" value="{s['duration_min']}" min="15" step="15" required>
             <label>Përshkrimi</label>
             <input type="text" name="s_desc" value="{s['description'] or ''}">
-            <div style="display:flex; gap:8px; margin-top:10px;">
-              <button type="submit" class="btn-3d btn-vishnje-3d" style="flex:1; padding:8px 12px; font-size:0.88rem;">
-                💾 Ruaj
-              </button>
-            </div>
           </form>
           <form method="POST" style="margin-top:6px;">
             <input type="hidden" name="action" value="delete_service">
             <input type="hidden" name="svc_id" value="{s['id']}">
-            <button type="submit" class="btn-sm-3d btn-del" style="width:100%;">🗑️ Hiq Artikullin</button>
+            <button type="submit" class="btn-sm-3d btn-del" style="width:100%;">🗑️ Hiq Shërbimin</button>
           </form>
         </div>
         """
@@ -3561,20 +3002,40 @@ def admin_panel():
     alert_html = ""
     if feedback_msg:
         cls = "alert-ok" if feedback_type == "ok" else "alert-err"
-        alert_html = f'<div class="alert {cls}">{feedback_msg}</div>'
+        alert_html = f"""
+        <div class="alert {cls}">
+          <span>{feedback_msg}</span>
+          <button type="button" class="dismiss-btn" data-no-auto-refresh onclick="this.parentElement.remove()">Hiq ✕</button>
+        </div>
+        """
 
     max_existing_id = max([a["id"] for a in appts], default=0)
+    w_start = settings.get("work_start") or WORK_START
+    w_end = settings.get("work_end") or WORK_END
+    step_min = int(settings.get("slot_step_min") or SLOT_STEP_MIN)
+    hygiene_note = settings.get("hygiene_note") or "Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje."
 
     inner = f"""
+      <div id="registeredClientsModal" class="modal-overlay" data-no-auto-refresh style="display:{'flex' if show_clients_modal else 'none'};">
+        <div class="modal-card" data-no-auto-refresh>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <b style="color:#72091d; font-size:0.96rem;">👥 Klientët e Regjistruar ({len(registered_clients)})</b>
+            <button type="button" data-no-auto-refresh onclick="closeRegisteredClientsModal()" style="background:none; border:none; font-size:1.1rem; font-weight:800; color:#72091d; cursor:pointer;">✕</button>
+          </div>
+          <p style="margin:0 0 10px; font-size:0.75rem; color:var(--muted);">
+            Prekni një klient për të shfaqur butonin <b>Refresko Password</b>.
+          </p>
+          {ext_link_banner}
+          {registered_clients_html}
+        </div>
+      </div>
+
       <div id="liveToastBanner" class="live-toast-banner">
         <div style="display:flex; justify-content:space-between; align-items:center;">
-          <b style="font-size:1.02rem;">🔔 REZERVIM I RI SAPO ERDH!</b>
-          <button type="button" onclick="document.getElementById('liveToastBanner').style.display='none'" style="background:none; border:none; color:#fff; font-weight:900; font-size:1.15rem; cursor:pointer;">✕</button>
+          <b style="font-size:0.95rem;">🔔 NJOFTIM I RI — GRANDE STUDIO</b>
+          <button type="button" data-no-auto-refresh onclick="dismissLiveToast()" style="background:rgba(255,255,255,0.22); border:none; color:#fff; font-weight:900; font-size:0.8rem; border-radius:8px; padding:4px 9px; cursor:pointer;">Hiq ✕</button>
         </div>
-        <div id="liveToastBody" style="font-size:0.88rem; margin-top:6px; line-height:1.4;"></div>
-        <button type="button" onclick="window.location.reload()" style="margin-top:9px; width:100%; background:#fff; color:#be123c; border:none; border-radius:9px; padding:7px; font-weight:800; cursor:pointer;">
-          🔄 Rifresko Listën Tani
-        </button>
+        <div id="liveToastBody" style="font-size:0.82rem; margin-top:6px; line-height:1.4;"></div>
       </div>
 
       <header>
@@ -3597,25 +3058,33 @@ def admin_panel():
       <div class="container">
         {alert_html}
 
-        {clients_section_html}
-
-        <div class="card-3d" style="background: linear-gradient(135deg, #fff5f7, #ffffff); border-color: #f43f5e;">
-          <h2>🔔 Njoftimet në Telefonin e Adminit</h2>
-          <p style="margin:0 0 10px; font-size:0.86rem; color:var(--muted); line-height:1.4;">
-            Aktivizoni njoftimet që të merrni sinjalizim <b>me zë dhe mesazh në ekran</b> sa herë që një klient bën rezervim të ri.
-          </p>
-          <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <button type="button" id="enablePushBtn" onclick="enableAdminNotifications()" class="btn-3d btn-vishnje-3d" style="flex:1; padding:9px 10px; font-size:0.86rem;">
-              🔔 Aktivizo Njoftimet &amp; Zërin
+        <div class="card-3d" style="padding:11px 12px; background:#fff9fb;">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+            <div style="font-size:0.76rem; font-weight:700; color:var(--vishnje);">
+              🔔 Njoftimet &amp; zëri aktivë • <span id="autoSaveIndicator">Ruajtje automatike</span>
+            </div>
+            <button type="button" data-no-auto-refresh onclick="openRegisteredClientsModal()" class="btn-3d btn-vishnje-3d" style="padding:7px 11px; font-size:0.76rem;">
+              👥 Klientët e Regjistruar ({len(registered_clients)})
             </button>
-            <form method="POST" style="margin:0;">
-              <input type="hidden" name="action" value="test_push">
-              <button type="submit" onclick="playNotificationChime()" class="btn-3d" style="background:#ffe4e6; color:#be123c; padding:9px 11px; font-size:0.86rem; border:1px solid #fda4af;">
-                🔊 Testo Zërin
-              </button>
-            </form>
           </div>
-          <div id="pushStatusText" style="font-size:0.82rem; font-weight:700; color:var(--vishnje); margin-top:7px;"></div>
+        </div>
+
+        <div class="card-3d" id="salonSettingsBox">
+          <h2>⚙️ Cilësimet e Sallonit (Ruajtje Automatike)</h2>
+          <div class="row-2">
+            <div>
+              <label for="cfg_work_start">Hapja e Orarit</label>
+              <input type="time" id="cfg_work_start" class="salon-cfg-input" value="{w_start}">
+            </div>
+            <div>
+              <label for="cfg_work_end">Mbyllja e Orarit</label>
+              <input type="time" id="cfg_work_end" class="salon-cfg-input" value="{w_end}">
+            </div>
+          </div>
+          <label for="cfg_slot_step">Hapi i Orareve (minuta)</label>
+          <input type="number" id="cfg_slot_step" class="salon-cfg-input" value="{step_min}" min="15" step="15">
+          <label for="cfg_hygiene_note">Shënimi i Higjienës &amp; Sterilizimit</label>
+          <input type="text" id="cfg_hygiene_note" class="salon-cfg-input" value="{hygiene_note}">
         </div>
 
         {new_bookings_section}
@@ -3628,7 +3097,7 @@ def admin_panel():
                 <tr>
                   <th>Data/Ora</th>
                   <th>Klienti</th>
-                  <th>Artikulli</th>
+                  <th>Shërbimi</th>
                   <th>Statusi</th>
                   <th>Veprime</th>
                 </tr>
@@ -3641,7 +3110,7 @@ def admin_panel():
         </div>
 
         <div class="card-3d">
-          <h2>➕ Shto Artikull të Ri (Thonj, Qerpikë, Vetulla, Kombinim)</h2>
+          <h2>➕ Shto Shërbim të Ri (Thonj, Qerpikë, Vetulla, Kombinim)</h2>
           <form method="POST">
             <input type="hidden" name="action" value="add_service">
             <div class="row-2">
@@ -3659,21 +3128,21 @@ def admin_panel():
                 <input type="number" name="s_price" value="25" min="0" step="0.5" required>
               </div>
             </div>
-            <label>Emri i artikullit</label>
+            <label>Emri i shërbimit</label>
             <input type="text" name="s_name" placeholder="p.sh. Laminim Vetullash + Xhel" required>
             <label>Kohëzgjatja (minuta)</label>
             <input type="number" name="s_dur" value="60" min="15" step="15" required>
             <label>Përshkrim i shkurtër</label>
             <input type="text" name="s_desc" placeholder="p.sh. Rezultat natyral dhe afatgjatë">
             <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px;">
-              💾 Shto dhe Ruaj Artikullin
+              Shto Shërbimin
             </button>
           </form>
         </div>
 
         <div class="card-3d">
-          <h2>✏️ Ndrysho ose Hiq Artikujt Ekzistues</h2>
-          {editable_services_html if editable_services_html else '<p style="font-size:0.9rem;color:var(--muted);">Nuk ka artikuj aktualisht. Shtoni një artikull më lart.</p>'}
+          <h2>✏️ Ndrysho ose Hiq Shërbimet Ekzistuese</h2>
+          {editable_services_html if editable_services_html else '<p style="font-size:0.82rem;color:var(--muted);">Nuk ka shërbime aktualisht. Shtoni një shërbim më lart.</p>'}
         </div>
 
         <div class="card-3d">
@@ -3689,7 +3158,7 @@ def admin_panel():
             <label>Deri në orë</label>
             <input type="time" name="block_end" value="13:00" required>
             <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px;">
-              💾 Ruaj Bllokimin
+              Blloko Orarin
             </button>
           </form>
         </div>
@@ -3708,7 +3177,7 @@ def admin_panel():
             <input type="password" name="confirm_password" id="confirm_password" required>
 
             <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px;">
-              💾 Ruaj Fjalëkalimin
+              Ndrysho Fjalëkalimin
             </button>
           </form>
         </div>
@@ -3716,61 +3185,88 @@ def admin_panel():
 
       <script>
         let lastKnownMaxId = {max_existing_id};
+        const saveIndicator = document.getElementById('autoSaveIndicator');
 
-        function toggleClientsSection() {{
-          const box = document.getElementById('clientsListContainer');
-          const btn = document.getElementById('toggleClientsBtn');
-          if (!box) return;
-          const isHidden = box.style.display === 'none' || box.style.display === '';
-          box.style.display = isHidden ? 'block' : 'none';
-          if (btn) btn.textContent = isHidden ? 'Mbyll Listën' : 'Shiko Klientët';
+        function openRegisteredClientsModal() {{
+          const m = document.getElementById('registeredClientsModal');
+          if (m) m.style.display = 'flex';
         }}
 
-        if ('serviceWorker' in navigator) {{
-          navigator.serviceWorker.addEventListener('message', (event) => {{
-            if (event.data && event.data.type === 'PLAY_CHIME') {{
-              playNotificationChime();
-            }}
+        function closeRegisteredClientsModal() {{
+          const m = document.getElementById('registeredClientsModal');
+          if (m) m.style.display = 'none';
+        }}
+
+        function selectRegisteredClient(clientId, cardEl) {{
+          document.querySelectorAll('.client-list-item').forEach(el => {{
+            el.classList.remove('selected');
+            const f = el.querySelector('.refresh-pwd-form');
+            if (f) f.style.display = 'none';
           }});
-        }}
-
-        async function enableAdminNotifications() {{
-          const statusEl = document.getElementById('pushStatusText');
-          playNotificationChime();
-
-          if (!('Notification' in window)) {{
-            statusEl.textContent = '⚠️ Për iPhone: Shtypni Share -> Add to Home Screen fillimisht!';
-            return;
-          }}
-
-          const perm = await Notification.requestPermission();
-          if (perm !== 'granted') {{
-            statusEl.textContent = '❌ Leja për njoftime u refuzua në cilësimet e telefonit.';
-            return;
-          }}
-
-          statusEl.textContent = '✅ Zëri dhe njoftimet vizuale u aktivizuan!';
-
-          if ('serviceWorker' in navigator && 'PushManager' in window) {{
-            try {{
-              const reg = await navigator.serviceWorker.ready;
-              const keyRes = await fetch('/api/push/public-key');
-              const keyData = await keyRes.json();
-              if (keyData.publicKey) {{
-                const sub = await reg.pushManager.subscribe({{
-                  userVisibleOnly: true,
-                  applicationServerKey: urlBase64ToUint8Array(keyData.publicKey)
-                }});
-                await fetch('/api/push/subscribe', {{
-                  method: 'POST',
-                  headers: {{ 'Content-Type': 'application/json' }},
-                  body: JSON.stringify(sub)
-                }});
-                statusEl.textContent = '✅ Telefoni u regjistrua! Do të merrni njoftime edhe kur ekrani është i mbyllur.';
-              }}
-            }} catch (err) {{}}
+          if (cardEl) {{
+            cardEl.classList.add('selected');
+            const form = cardEl.querySelector('.refresh-pwd-form');
+            if (form) form.style.display = 'block';
           }}
         }}
+
+        function dismissLiveToast() {{
+          const toast = document.getElementById('liveToastBanner');
+          if (toast) toast.style.display = 'none';
+        }}
+
+        async function pushSalonSettingsAuto() {{
+          const payload = {{
+            work_start: document.getElementById('cfg_work_start').value,
+            work_end: document.getElementById('cfg_work_end').value,
+            slot_step_min: document.getElementById('cfg_slot_step').value,
+            hygiene_note: document.getElementById('cfg_hygiene_note').value
+          }};
+          try {{
+            const res = await fetch('/api/admin/auto-save-settings', {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify(payload)
+            }});
+            const data = await res.json();
+            if (data.ok && saveIndicator) {{
+              saveIndicator.textContent = 'U ruajt automatikisht në ' + data.saved_at;
+            }}
+          }} catch (e) {{}}
+        }}
+
+        let cfgTimer = null;
+        document.querySelectorAll('.salon-cfg-input').forEach(inp => {{
+          inp.addEventListener('change', () => {{
+            if (cfgTimer) clearTimeout(cfgTimer);
+            cfgTimer = setTimeout(pushSalonSettingsAuto, 250);
+          }});
+          inp.addEventListener('input', () => {{
+            if (cfgTimer) clearTimeout(cfgTimer);
+            cfgTimer = setTimeout(pushSalonSettingsAuto, 550);
+          }});
+        }});
+
+        const svcTimers = new Map();
+        document.querySelectorAll('.auto-save-form').forEach((form, idx) => {{
+          const triggerSave = () => {{
+            if (svcTimers.has(idx)) clearTimeout(svcTimers.get(idx));
+            const t = setTimeout(async () => {{
+              try {{
+                const fd = new FormData(form);
+                await fetch('/admin', {{ method: 'POST', body: fd }});
+                if (saveIndicator) {{
+                  saveIndicator.textContent = 'Shërbimi u ruajt automatikisht';
+                }}
+              }} catch (e) {{}}
+            }}, 450);
+            svcTimers.set(idx, t);
+          }};
+          form.querySelectorAll('input, select').forEach(el => {{
+            el.addEventListener('change', triggerSave);
+            el.addEventListener('input', triggerSave);
+          }});
+        }});
 
         setInterval(async () => {{
           try {{
@@ -3781,7 +3277,7 @@ def admin_panel():
               const newest = data.bookings[0];
               if (newest.id > lastKnownMaxId) {{
                 lastKnownMaxId = newest.id;
-                playNotificationChime();
+                playAutoAlertSound();
                 if (navigator.vibrate) navigator.vibrate([300, 150, 300]);
 
                 const toast = document.getElementById('liveToastBanner');
@@ -3794,7 +3290,7 @@ def admin_panel():
         }}, 5000);
       </script>
     """
-    return render_iphone_shell("Paneli i Adminit — Grande Studio", inner)
+    return render_iphone_shell("Paneli i Adminit — Grande Studio", inner, role_tag="admin")
 
 
 if __name__ == "__main__":
