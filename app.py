@@ -1,6 +1,3 @@
-import base64
-import hashlib
-import hmac
 import html
 import json
 import os
@@ -9,12 +6,7 @@ import secrets
 import smtplib
 import sqlite3
 import string
-import struct
-import subprocess
-import sys
-import tempfile
 import time
-import zlib
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from functools import wraps
@@ -27,31 +19,9 @@ try:
 except ImportError:
     HAS_PIL = False
 
-
-def ensure_push_dependencies() -> bool:
-    """Kontrollon dhe nëse mungon, tenton të instalojë pywebpush + cryptography për Web Push në sfond."""
-    try:
-        import pywebpush  # noqa: F401
-        import py_vapid  # noqa: F401
-        from cryptography.hazmat.primitives import serialization  # noqa: F401
-        return True
-    except ImportError:
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--quiet", "pywebpush", "py-vapid", "cryptography"],
-                timeout=120,
-            )
-            return True
-        except Exception as exc:
-            print(f"[WEBPUSH] Nuk u instaluan dot paketat automatikisht: {exc}")
-            return False
-
-
-_PUSH_READY = ensure_push_dependencies()
 try:
     from pywebpush import webpush, WebPushException
     from py_vapid import Vapid
-    from cryptography.hazmat.primitives import serialization
     HAS_WEBPUSH = True
 except ImportError:
     HAS_WEBPUSH = False
@@ -64,6 +34,15 @@ SCRIPT_MTIME = os.path.getmtime(__file__) if os.path.exists(__file__) else 0
 IG_USERNAME = "grande_studio3"
 IG_WEB_URL = f"https://www.instagram.com/{IG_USERNAME}/"
 IG_APP_URL = f"instagram://user?username={IG_USERNAME}"
+
+app = Flask(__name__, static_folder=STATIC_DIR)
+app.secret_key = os.environ.get("SECRET_KEY") or "grande_studio_persistent_secret_key_2026"
+app.permanent_session_lifetime = timedelta(days=3650)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+DB_PATH = os.path.join(BASE_DIR, "grande_studio.db")
+VAPID_KEYS_PATH = os.path.join(BASE_DIR, "vapid_keys.json")
 
 # Orari i punës së sallonit (09:00 - 18:30, hap çdo 30 minuta)
 WORK_START = "09:00"
@@ -83,88 +62,6 @@ MAX_FAILED_ATTEMPTS = 5
 LOCK_WINDOW_SECONDS = 300
 
 
-def esc(val) -> str:
-    return html.escape(str(val or ""), quote=True)
-
-
-def resolve_db_path() -> str:
-    env_dir = (os.environ.get("DATA_DIR") or "").strip()
-    candidate_dirs = [d for d in [env_dir, BASE_DIR, tempfile.gettempdir()] if d]
-
-    for folder in candidate_dirs:
-        try:
-            os.makedirs(folder, exist_ok=True)
-            db_file = os.path.join(folder, "grande_studio.db")
-            if os.path.exists(db_file):
-                try:
-                    os.chmod(db_file, 0o666)
-                except OSError:
-                    pass
-            test_conn = sqlite3.connect(db_file, timeout=15)
-            test_conn.execute("CREATE TABLE IF NOT EXISTS _write_test (id INTEGER)")
-            test_conn.execute("DROP TABLE IF EXISTS _write_test")
-            test_conn.commit()
-            test_conn.close()
-            return db_file
-        except sqlite3.OperationalError as exc:
-            if "readonly" in str(exc).lower() or "permission" in str(exc).lower():
-                continue
-            return db_file
-        except OSError:
-            continue
-
-    fallback_tmp = os.path.join(tempfile.gettempdir(), "grande_studio.db")
-    os.makedirs(os.path.dirname(fallback_tmp), exist_ok=True)
-    return fallback_tmp
-
-
-DB_PATH = resolve_db_path()
-DATA_FOLDER = os.path.dirname(DB_PATH)
-VAPID_KEYS_PATH = os.path.join(DATA_FOLDER, "vapid_keys.json")
-SECRET_KEY_PATH = os.path.join(DATA_FOLDER, "flask_secret.key")
-
-
-def load_or_create_secret_key() -> str:
-    env_key = (os.environ.get("SECRET_KEY") or "").strip()
-    if env_key:
-        return env_key
-    try:
-        if os.path.exists(SECRET_KEY_PATH):
-            with open(SECRET_KEY_PATH, "r", encoding="utf-8") as f:
-                saved = f.read().strip()
-                if saved:
-                    return saved
-        generated = secrets.token_hex(32)
-        with open(SECRET_KEY_PATH, "w", encoding="utf-8") as f:
-            f.write(generated)
-        return generated
-    except Exception:
-        return "grande_studio_persistent_secret_key_2026"
-
-
-app = Flask(__name__, static_folder=STATIC_DIR)
-app.secret_key = load_or_create_secret_key()
-app.permanent_session_lifetime = timedelta(days=3650)
-app.config["SESSION_REFRESH_EACH_REQUEST"] = True
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-
-
-def sign_auth_token(raw_token: str) -> str:
-    sig = hmac.new(app.secret_key.encode("utf-8"), raw_token.encode("utf-8"), hashlib.sha256).hexdigest()
-    return f"{raw_token}.{sig}"
-
-
-def verify_signed_token(signed_val: str) -> str | None:
-    if not signed_val or "." not in signed_val:
-        return None
-    raw_token, sig = signed_val.rsplit(".", 1)
-    expected = hmac.new(app.secret_key.encode("utf-8"), raw_token.encode("utf-8"), hashlib.sha256).hexdigest()
-    if hmac.compare_digest(sig, expected):
-        return raw_token
-    return None
-
-
 def get_vapid_keys() -> dict:
     """Gjeneron ose ngarkon çelësat VAPID për Web Push Notifications në iPhone & Android."""
     if os.path.exists(VAPID_KEYS_PATH):
@@ -178,12 +75,14 @@ def get_vapid_keys() -> dict:
 
     if HAS_WEBPUSH:
         try:
+            import base64
+            from cryptography.hazmat.primitives import serialization
             vapid = Vapid()
             vapid.generate_keys()
             priv_pem = vapid.private_pem().decode("utf-8")
             pub_raw = vapid.public_key.public_bytes(
                 serialization.Encoding.X962,
-                serialization.PublicFormat.UncompressedPoint,
+                serialization.PublicFormat.UncompressedPoint
             )
             pub_b64 = base64.urlsafe_b64encode(pub_raw).rstrip(b"=").decode("utf-8")
             keys = {"private_key": priv_pem, "public_key": pub_b64}
@@ -392,13 +291,14 @@ def prepare_app_icons() -> None:
         except Exception:
             pass
 
+    import zlib
+    import struct
+
     def make_solid_png(w: int, h: int, rgba: tuple[int, int, int, int]) -> bytes:
         raw_row = b"\x00" + bytes(rgba) * w
         raw_data = raw_row * h
-
         def chunk(tag: bytes, data: bytes) -> bytes:
             return struct.pack("!I", len(data)) + tag + data + struct.pack("!I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-
         ihdr = struct.pack("!IIBBBBB", w, h, 8, 6, 0, 0, 0)
         return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw_data)) + chunk(b"IEND", b"")
 
@@ -409,341 +309,165 @@ def prepare_app_icons() -> None:
 
 
 def get_db():
-    global DB_PATH
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA busy_timeout = 15000")
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
-    except sqlite3.OperationalError:
-        DB_PATH = resolve_db_path()
-        conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA busy_timeout = 15000")
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
 
 
 def init_db():
     conn = get_db()
-    try:
-        cur = conn.cursor()
+    cur = conn.cursor()
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS admin_account (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                email TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS auth_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                token TEXT UNIQUE NOT NULL,
-                role TEXT NOT NULL,
-                client_id INTEGER,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS salon_settings (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                work_start TEXT NOT NULL DEFAULT '09:00',
-                work_end TEXT NOT NULL DEFAULT '18:30',
-                slot_step_min INTEGER NOT NULL DEFAULT 30,
-                hygiene_note TEXT NOT NULL DEFAULT 'Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.',
-                updated_at TEXT NOT NULL
-            )
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS clients (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                full_name TEXT NOT NULL DEFAULT '',
-                contact_type TEXT NOT NULL DEFAULT 'instagram',
-                contact_value TEXT UNIQUE NOT NULL,
-                client_phone TEXT NOT NULL DEFAULT '',
-                password_hash TEXT NOT NULL DEFAULT '',
-                is_blocked INTEGER NOT NULL DEFAULT 0,
-                reset_pending INTEGER NOT NULL DEFAULT 0,
-                reset_token TEXT NOT NULL DEFAULT '',
-                reset_sent_via TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL DEFAULT ''
-            )
-        """)
-
-        cur.execute("PRAGMA table_info(clients)")
-        client_cols = [row["name"] for row in cur.fetchall()]
-        for col_name, col_sql in [
-            ("full_name", "ALTER TABLE clients ADD COLUMN full_name TEXT NOT NULL DEFAULT ''"),
-            ("client_phone", "ALTER TABLE clients ADD COLUMN client_phone TEXT NOT NULL DEFAULT ''"),
-            ("is_blocked", "ALTER TABLE clients ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0"),
-            ("reset_pending", "ALTER TABLE clients ADD COLUMN reset_pending INTEGER NOT NULL DEFAULT 0"),
-            ("reset_token", "ALTER TABLE clients ADD COLUMN reset_token TEXT NOT NULL DEFAULT ''"),
-            ("reset_sent_via", "ALTER TABLE clients ADD COLUMN reset_sent_via TEXT NOT NULL DEFAULT ''"),
-            ("updated_at", "ALTER TABLE clients ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"),
-        ]:
-            if col_name not in client_cols:
-                cur.execute(col_sql)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS services (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category TEXT NOT NULL,
-                name TEXT NOT NULL,
-                duration_min INTEGER NOT NULL,
-                price REAL NOT NULL,
-                description TEXT DEFAULT ''
-            )
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS appointments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                client_name TEXT NOT NULL,
-                client_phone TEXT NOT NULL,
-                client_contact TEXT DEFAULT '',
-                service_id INTEGER,
-                appt_date TEXT NOT NULL,
-                start_time TEXT NOT NULL,
-                end_time TEXT NOT NULL,
-                notes TEXT DEFAULT '',
-                status TEXT DEFAULT 'Konfirmuar',
-                is_new INTEGER DEFAULT 1,
-                client_notified INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (service_id) REFERENCES services (id) ON DELETE SET NULL
-            )
-        """)
-
-        cur.execute("PRAGMA table_info(appointments)")
-        appt_cols = [row["name"] for row in cur.fetchall()]
-        for col_name, col_sql in [
-            ("is_new", "ALTER TABLE appointments ADD COLUMN is_new INTEGER DEFAULT 0"),
-            ("client_contact", "ALTER TABLE appointments ADD COLUMN client_contact TEXT DEFAULT ''"),
-            ("client_notified", "ALTER TABLE appointments ADD COLUMN client_notified INTEGER DEFAULT 0"),
-        ]:
-            if col_name not in appt_cols:
-                cur.execute(col_sql)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS push_subscriptions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                endpoint TEXT UNIQUE NOT NULL,
-                subscription_json TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'admin',
-                client_contact TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        cur.execute("PRAGMA table_info(push_subscriptions)")
-        push_cols = [row["name"] for row in cur.fetchall()]
-        for col_name, col_sql in [
-            ("role", "ALTER TABLE push_subscriptions ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'"),
-            ("client_contact", "ALTER TABLE push_subscriptions ADD COLUMN client_contact TEXT NOT NULL DEFAULT ''"),
-        ]:
-            if col_name not in push_cols:
-                cur.execute(col_sql)
-
-        cur.execute("SELECT COUNT(*) AS cnt FROM salon_settings")
-        if cur.fetchone()["cnt"] == 0:
-            cur.execute(
-                """
-                INSERT INTO salon_settings (id, work_start, work_end, slot_step_min, hygiene_note, updated_at)
-                VALUES (1, ?, ?, ?, ?, ?)
-                """,
-                (
-                    WORK_START,
-                    WORK_END,
-                    SLOT_STEP_MIN,
-                    "Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.",
-                    datetime.now().isoformat(),
-                ),
-            )
-
-        cur.execute("SELECT COUNT(*) AS cnt FROM services")
-        if cur.fetchone()["cnt"] == 0:
-            default_services = [
-                ("Thonj", "Manikyr me Xhel (Gel Polish)", 60, 15.0, "Pastrim kutikulash, formësim dhe xhel me shkëlqim vishnje."),
-                ("Thonj", "Zgjatje me Tipsa / Xhel", 90, 25.0, "Zgjatje natyrale ose të gjata me përforcim xheli."),
-                ("Thonj", "Pedikyr Estetik + Xhel", 75, 22.0, "Trajtim i plotë i shputave dhe ngjyrë xheli."),
-                ("Qerpikë", "Lash Lift & Tint (Ngritje Qerpikësh)", 60, 25.0, "Ngritje dhe ngjyrosje për pamje të hapur e natyrale."),
-                ("Qerpikë", "Zgjatje Qerpikësh Classic / Volume", 120, 35.0, "Fije të lehta dhe të buta të përshtatura për formën e syrit."),
-                ("Vetulla", "Laminim Vetullash + Formësim", 45, 20.0, "Rregullim, ushqim dhe formësim i saktë i vetullave."),
-                ("Vetulla", "Dizajn, Depilim & Ngjyrosje Vetullash", 30, 12.0, "Pastrim dhe nuancim harmonik sipas fizionomisë."),
-                ("Kombinim", "Paketa Grande: Manikyr Xhel + Laminim Vetullash", 105, 32.0, "Kombinim ideal për thonj të kuruar dhe vetulla të rregulluara."),
-                ("Kombinim", "Kombo Qerpikë (Lash Lift) + Vetulla (Dizajn & Tint)", 90, 33.0, "Pamje e freskët e syve pa nevojë për grim të përditshëm."),
-                ("Kombinim", "Total Glow: Thonj Xhel + Qerpikë + Vetulla", 150, 52.0, "Trajtim i plotë i kombinuar për thonj, qerpikë dhe vetulla."),
-            ]
-            cur.executemany(
-                "INSERT INTO services (category, name, duration_min, price, description) VALUES (?, ?, ?, ?, ?)",
-                default_services,
-            )
-
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def issue_persistent_login(role: str, client_id: int | None = None) -> str:
-    """Krijon një token të qëndrueshëm në databazë që mban Adminin ose Klientin kyçur derisa të shtypet 'Dil'."""
-    init_db()
-    raw_token = secrets.token_urlsafe(32)
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO auth_sessions (token, role, client_id, created_at) VALUES (?, ?, ?, ?)",
-            (raw_token, role, client_id, datetime.now().isoformat()),
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admin_account (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            email TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         )
-        conn.commit()
-    finally:
-        conn.close()
+    """)
 
-    signed = sign_auth_token(raw_token)
-    session.permanent = True
-    if role == "admin":
-        session["admin_logged_in"] = True
-        session["admin_persist_token"] = signed
-        g_pending_cookies["gs_admin_token"] = signed
-    elif role == "client" and client_id:
-        session["client_logged_in"] = True
-        session["client_id"] = client_id
-        session["client_persist_token"] = signed
-        g_pending_cookies["gs_client_token"] = signed
-    return signed
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS salon_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            work_start TEXT NOT NULL DEFAULT '09:00',
+            work_end TEXT NOT NULL DEFAULT '18:30',
+            slot_step_min INTEGER NOT NULL DEFAULT 30,
+            hygiene_note TEXT NOT NULL DEFAULT 'Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.',
+            updated_at TEXT NOT NULL
+        )
+    """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL DEFAULT '',
+            contact_type TEXT NOT NULL,
+            contact_value TEXT UNIQUE NOT NULL,
+            client_phone TEXT DEFAULT '',
+            password_hash TEXT NOT NULL,
+            reset_pending INTEGER DEFAULT 0,
+            reset_token TEXT DEFAULT '',
+            reset_sent_via TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
 
-def revoke_persistent_login(role: str) -> None:
-    """Fshin tokenin vetëm kur përdoruesi klikon butonin 'Dil'."""
-    candidates = []
-    if role == "admin":
-        for val in (session.get("admin_persist_token"), request.cookies.get("gs_admin_token"), request.headers.get("X-Admin-Token")):
-            raw = verify_signed_token(val or "")
-            if raw:
-                candidates.append(raw)
-        session.pop("admin_logged_in", None)
-        session.pop("admin_persist_token", None)
-        g_deleted_cookies.add("gs_admin_token")
-    elif role == "client":
-        for val in (session.get("client_persist_token"), request.cookies.get("gs_client_token"), request.headers.get("X-Client-Token")):
-            raw = verify_signed_token(val or "")
-            if raw:
-                candidates.append(raw)
-        g_deleted_cookies.add("gs_client_token")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS services (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            name TEXT NOT NULL,
+            duration_min INTEGER NOT NULL,
+            price REAL NOT NULL,
+            description TEXT DEFAULT ''
+        )
+    """)
 
-    if candidates:
-        conn = get_db()
-        try:
-            cur = conn.cursor()
-            cur.executemany("DELETE FROM auth_sessions WHERE token = ? AND role = ?", [(t, role) for t in candidates])
-            conn.commit()
-        finally:
-            conn.close()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS appointments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT NOT NULL,
+            client_phone TEXT NOT NULL,
+            client_contact TEXT DEFAULT '',
+            service_id INTEGER,
+            appt_date TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            notes TEXT DEFAULT '',
+            status TEXT DEFAULT 'Konfirmuar',
+            is_new INTEGER DEFAULT 1,
+            client_notified INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (service_id) REFERENCES services (id) ON DELETE SET NULL
+        )
+    """)
 
+    cur.execute("PRAGMA table_info(appointments)")
+    appt_cols = [row["name"] for row in cur.fetchall()]
+    if "is_new" not in appt_cols:
+        cur.execute("ALTER TABLE appointments ADD COLUMN is_new INTEGER DEFAULT 0")
+    if "client_contact" not in appt_cols:
+        cur.execute("ALTER TABLE appointments ADD COLUMN client_contact TEXT DEFAULT ''")
+    if "client_notified" not in appt_cols:
+        cur.execute("ALTER TABLE appointments ADD COLUMN client_notified INTEGER DEFAULT 0")
 
-from flask import g
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            endpoint TEXT UNIQUE NOT NULL,
+            subscription_json TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'admin',
+            client_contact TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
 
-g_pending_cookies_map = {}
+    cur.execute("PRAGMA table_info(push_subscriptions)")
+    push_cols = [row["name"] for row in cur.fetchall()]
+    if "role" not in push_cols:
+        cur.execute("ALTER TABLE push_subscriptions ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
+    if "client_contact" not in push_cols:
+        cur.execute("ALTER TABLE push_subscriptions ADD COLUMN client_contact TEXT NOT NULL DEFAULT ''")
 
+    cur.execute("SELECT COUNT(*) AS cnt FROM salon_settings")
+    if cur.fetchone()["cnt"] == 0:
+        cur.execute(
+            """
+            INSERT INTO salon_settings (id, work_start, work_end, slot_step_min, hygiene_note, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?)
+            """,
+            (
+                WORK_START,
+                WORK_END,
+                SLOT_STEP_MIN,
+                "Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.",
+                datetime.now().isoformat(),
+            ),
+        )
 
-@app.before_request
-def restore_persistent_sessions():
-    init_db()
-    g.set_cookies = {}
-    g.del_cookies = set()
+    cur.execute("SELECT COUNT(*) AS cnt FROM services")
+    if cur.fetchone()["cnt"] == 0:
+        default_services = [
+            ("Thonj", "Manikyr me Xhel (Gel Polish)", 60, 15.0, "Pastrim kutikulash, formësim dhe xhel me shkëlqim vishnje."),
+            ("Thonj", "Zgjatje me Tipsa / Xhel", 90, 25.0, "Zgjatje natyrale ose të gjata me përforcim xheli."),
+            ("Thonj", "Pedikyr Estetik + Xhel", 75, 22.0, "Trajtim i plotë i shputave dhe ngjyrë xheli."),
+            ("Qerpikë", "Lash Lift & Tint (Ngritje Qerpikësh)", 60, 25.0, "Ngritje dhe ngjyrosje për pamje të hapur e natyrale."),
+            ("Qerpikë", "Zgjatje Qerpikësh Classic / Volume", 120, 35.0, "Fije të lehta dhe të buta të përshtatura për formën e syrit."),
+            ("Vetulla", "Laminim Vetullash + Formësim", 45, 20.0, "Rregullim, ushqim dhe formësim i saktë i vetullave."),
+            ("Vetulla", "Dizajn, Depilim & Ngjyrosje Vetullash", 30, 12.0, "Pastrim dhe nuancim harmonik sipas fizionomisë."),
+            ("Kombinim", "Paketa Grande: Manikyr Xhel + Laminim Vetullash", 105, 32.0, "Kombinim ideal për thonj të kuruar dhe vetulla të rregulluara."),
+            ("Kombinim", "Kombo Qerpikë (Lash Lift) + Vetulla (Dizajn & Tint)", 90, 33.0, "Pamje e freskët e syve pa nevojë për grim të përditshëm."),
+            ("Kombinim", "Total Glow: Thonj Xhel + Qerpikë + Vetulla", 150, 52.0, "Trajtim i plotë i kombinuar për thonj, qerpikë dhe vetulla."),
+        ]
+        cur.executemany(
+            "INSERT INTO services (category, name, duration_min, price, description) VALUES (?, ?, ?, ?, ?)",
+            default_services,
+        )
 
-    # Rikthen sesionin e Adminit nga tokeni i qëndrueshëm nëse sesioni Flask u humb pas refresh
-    if not session.get("admin_logged_in"):
-        for src_val in (
-            session.get("admin_persist_token"),
-            request.cookies.get("gs_admin_token"),
-            request.headers.get("X-Admin-Token"),
-        ):
-            raw = verify_signed_token(src_val or "")
-            if raw:
-                conn = get_db()
-                try:
-                    cur = conn.cursor()
-                    cur.execute("SELECT id FROM auth_sessions WHERE token = ? AND role = 'admin'", (raw,))
-                    row = cur.fetchone()
-                finally:
-                    conn.close()
-                if row:
-                    session.permanent = True
-                    session["admin_logged_in"] = True
-                    session["admin_persist_token"] = sign_auth_token(raw)
-                    break
-
-    # Rikthen sesionin e Klientit nga tokeni i qëndrueshëm nëse sesioni Flask u humb pas refresh
-    if not session.get("client_logged_in"):
-        for src_val in (
-            session.get("client_persist_token"),
-            request.cookies.get("gs_client_token"),
-            request.headers.get("X-Client-Token"),
-        ):
-            raw = verify_signed_token(src_val or "")
-            if raw:
-                conn = get_db()
-                try:
-                    cur = conn.cursor()
-                    cur.execute(
-                        """
-                        SELECT s.client_id, c.contact_value, c.contact_type, c.full_name, c.client_phone, c.is_blocked
-                        FROM auth_sessions s
-                        JOIN clients c ON s.client_id = c.id
-                        WHERE s.token = ? AND s.role = 'client'
-                        """,
-                        (raw,),
-                    )
-                    c_row = cur.fetchone()
-                finally:
-                    conn.close()
-                if c_row and int(c_row["is_blocked"] or 0) == 0:
-                    session.permanent = True
-                    session["client_logged_in"] = True
-                    session["client_id"] = c_row["client_id"]
-                    session["client_contact"] = c_row["contact_value"]
-                    session["client_contact_type"] = c_row["contact_type"]
-                    session["client_name"] = c_row["full_name"] or c_row["contact_value"]
-                    session["client_phone"] = c_row["client_phone"] or ""
-                    session["client_persist_token"] = sign_auth_token(raw)
-                    break
-
-
-g_pending_cookies = {}
-g_deleted_cookies = set()
+    conn.commit()
+    conn.close()
 
 
 def normalize_contact_identifier(raw_val: str) -> tuple[str, str]:
     """Kthen (contact_type, normalized_value) ku contact_type është 'email' ose 'instagram'."""
     val = (raw_val or "").strip()
-    if not val:
-        return "instagram", ""
     if "@" in val and "." in val.split("@")[-1]:
         return "email", val.lower()
     ig_clean = val.lstrip("@").strip().lower()
-    if not ig_clean:
-        return "instagram", ""
-    return "instagram", f"@{ig_clean}"
+    return "instagram", f"@{ig_clean}" if ig_clean else ""
 
 
 def send_client_password_reset_notification(client_row: sqlite3.Row, reset_url: str) -> tuple[str, str]:
-    """Dërgon njoftim te klienti në Email ose Instagram dhe kthen (etiketa_kanalit, linku_direkt)."""
     c_type = client_row["contact_type"]
     c_val = client_row["contact_value"]
     msg_text = (
         f"Përshëndetje,\n\n"
-        f"Admini i Grande Studio ka aktivizuar rivendosjen e passwordit për llogarinë tuaj ({c_val}).\n"
-        f"Klikoni linkun më poshtë për të hapur dritaren dhe për të vendosur passwordin e ri:\n"
+        f"Admini i Grande Studio ka aktivizuar rivendosjen e fjalëkalimit për llogarinë tuaj ({c_val}).\n"
+        f"Hapni aplikacionin Grande Studio ose klikoni linkun më poshtë për të shënuar passwordin e ri:\n"
         f"{reset_url}\n"
     )
 
@@ -751,7 +475,7 @@ def send_client_password_reset_notification(client_row: sqlite3.Row, reset_url: 
         if SMTP_HOST and SMTP_USER and SMTP_PASS:
             try:
                 msg = EmailMessage()
-                msg["Subject"] = "Grande Studio — Rivendos Passwordin"
+                msg["Subject"] = "Grande Studio — Shëno passwordin e ri"
                 msg["From"] = SMTP_FROM
                 msg["To"] = c_val
                 msg.set_content(msg_text)
@@ -762,10 +486,7 @@ def send_client_password_reset_notification(client_row: sqlite3.Row, reset_url: 
             except Exception as exc:
                 print(f"[CLIENT EMAIL RESET] Gabim SMTP: {exc}")
         print(f"\n[GRANDE STUDIO - CLIENT EMAIL RESET] Për: {c_val} | Linku: {reset_url}\n")
-        return (
-            f"Email ({c_val})",
-            f"mailto:{c_val}?subject=Grande%20Studio%20-%20Rivendos%20Passwordin&body={msg_text.replace(chr(10), '%0A')}",
-        )
+        return f"Email ({c_val})", f"mailto:{c_val}?subject=Grande%20Studio%20-%20Sheno%20passwordin%20e%20ri&body={msg_text.replace(chr(10), '%0A')}"
 
     ig_handle = c_val.lstrip("@")
     ig_dm_url = f"https://www.instagram.com/{ig_handle}/"
@@ -773,156 +494,64 @@ def send_client_password_reset_notification(client_row: sqlite3.Row, reset_url: 
     return f"Instagram (@{ig_handle})", ig_dm_url
 
 
-def is_client_blocked_in_db(contact_val: str = "", client_id: int | None = None) -> bool:
-    if not contact_val and not client_id:
-        return False
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        row = None
-        if client_id:
-            cur.execute("SELECT is_blocked FROM clients WHERE id = ?", (client_id,))
-            row = cur.fetchone()
-        if not row and contact_val:
-            cur.execute("SELECT is_blocked FROM clients WHERE LOWER(contact_value) = ?", (contact_val.strip().lower(),))
-            row = cur.fetchone()
-        return bool(row and row["is_blocked"] == 1)
-    finally:
-        conn.close()
-
-
-def clear_client_session_keys() -> None:
-    revoke_persistent_login("client")
-    for k in ("client_logged_in", "client_id", "client_contact", "client_contact_type", "client_name", "client_phone", "client_persist_token"):
-        session.pop(k, None)
-
-
 def get_salon_settings() -> dict:
     conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM salon_settings WHERE id = 1")
-        row = cur.fetchone()
-        if row:
-            return dict(row)
-        return {
-            "work_start": WORK_START,
-            "work_end": WORK_END,
-            "slot_step_min": SLOT_STEP_MIN,
-            "hygiene_note": "Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.",
-        }
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM salon_settings WHERE id = 1")
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return {
+        "work_start": WORK_START,
+        "work_end": WORK_END,
+        "slot_step_min": SLOT_STEP_MIN,
+        "hygiene_note": "Veglat e thonjve, qerpikëve dhe vetullave sterilizohen pas çdo klienteje.",
+    }
 
 
-def get_admin_account():
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM admin_account WHERE id = 1")
-        return cur.fetchone()
-    finally:
-        conn.close()
-
-
-def is_admin_authenticated() -> bool:
-    if session.get("admin_logged_in"):
-        return True
-    for src_val in (
-        session.get("admin_persist_token"),
-        request.cookies.get("gs_admin_token") if request else None,
-        request.headers.get("X-Admin-Token") if request else None,
-    ):
-        raw = verify_signed_token(src_val or "")
-        if raw:
-            conn = get_db()
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT id FROM auth_sessions WHERE token = ? AND role = 'admin'", (raw,))
-                row = cur.fetchone()
-            finally:
-                conn.close()
-            if row:
-                session.permanent = True
-                session["admin_logged_in"] = True
-                session["admin_persist_token"] = sign_auth_token(raw)
-                return True
-    return False
-
-
-def get_vapid_subject() -> str:
-    acc = get_admin_account()
-    email_val = (acc["email"] if acc and acc["email"] else "").strip()
-    if "@" in email_val and "." in email_val and not email_val.endswith(".local"):
-        return f"mailto:{email_val}"
-    return "mailto:grande.studio.notifications@gmail.com"
-
-
-def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> tuple[int, list[str]]:
-    """Dërgon Web Push Notifications me prioritet të lartë për Lock Screen dhe kthen (sent_count, errors)."""
-    if not HAS_WEBPUSH:
-        return 0, ["Paketa pywebpush/cryptography nuk është e instaluar në server."]
-    if not subs:
-        return 0, ["Nuk ka abonime Push të regjistruara në databazë."]
+def dispatch_web_push(subs: list[sqlite3.Row], payload_dict: dict) -> None:
+    """Dërgon Web Push Notifications me prioritet të lartë (urgency: high) për zë, vibrim dhe banner në Lock Screen."""
+    if not HAS_WEBPUSH or not subs:
+        return
     vapid = get_vapid_keys()
     if not vapid.get("private_key"):
-        return 0, ["Çelësat VAPID nuk u gjeneruan."]
+        return
 
     payload = json.dumps(payload_dict, ensure_ascii=False)
-    vapid_sub = get_vapid_subject()
     dead_ids = []
-    sent_count = 0
-    errors = []
 
     for sub in subs:
         try:
             sub_info = json.loads(sub["subscription_json"])
-            if not sub_info.get("endpoint") or not sub_info.get("keys"):
-                continue
             webpush(
                 subscription_info=sub_info,
                 data=payload,
                 vapid_private_key=vapid["private_key"],
-                vapid_claims={"sub": vapid_sub},
+                vapid_claims={"sub": "mailto:noreply@grandestudio.local"},
                 ttl=86400,
-                content_encoding="aes128gcm",
-                headers={
-                    "Urgency": "high",
-                    "Topic": str(payload_dict.get("tag", "grande-studio"))[:32],
-                },
+                headers={"Urgency": "high", "Topic": payload_dict.get("tag", "grande-studio")}
             )
-            sent_count += 1
         except WebPushException as ex:
-            err_txt = str(ex)
-            print(f"[WEBPUSH] Gabim dërgimi: {err_txt}")
-            errors.append(err_txt[:140])
-            if ex.response is not None and ex.response.status_code in (404, 410):
+            if ex.response and ex.response.status_code in (404, 410):
                 dead_ids.append(sub["id"])
-        except Exception as e:
-            err_txt = str(e)
-            print(f"[WEBPUSH] Gabim i përgjithshëm: {err_txt}")
-            errors.append(err_txt[:140])
+        except Exception:
+            pass
 
     if dead_ids:
         conn = get_db()
-        try:
-            cur = conn.cursor()
-            cur.executemany("DELETE FROM push_subscriptions WHERE id = ?", [(i,) for i in dead_ids])
-            conn.commit()
-        finally:
-            conn.close()
-
-    return sent_count, errors
-
-
-def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int | None = None) -> tuple[int, list[str]]:
-    conn = get_db()
-    try:
         cur = conn.cursor()
-        cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'admin' ORDER BY id DESC")
-        subs = cur.fetchall()
-    finally:
+        cur.executemany("DELETE FROM push_subscriptions WHERE id = ?", [(i,) for i in dead_ids])
+        conn.commit()
         conn.close()
+
+
+def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int | None = None) -> None:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'admin'")
+    subs = cur.fetchall()
+    conn.close()
 
     actions = []
     if appt_id:
@@ -931,52 +560,49 @@ def send_push_to_admins(title: str, body: str, url: str = "/admin", appt_id: int
             {"action": "cancel_appt", "title": "❌ Anulo"},
         ]
 
-    return dispatch_web_push(
-        subs,
-        {
-            "title": title,
-            "body": body,
-            "url": url,
-            "appt_id": appt_id,
-            "tag": f"gs-admin-{appt_id or int(time.time())}",
-            "actions": actions,
-            "timestamp": datetime.now().isoformat(),
-        },
-    )
+    dispatch_web_push(subs, {
+        "title": title,
+        "body": body,
+        "url": url,
+        "appt_id": appt_id,
+        "tag": f"grande-studio-admin-{appt_id or 'alert'}",
+        "actions": actions,
+        "timestamp": datetime.now().isoformat()
+    })
 
 
-def send_push_to_client(client_contact: str, title: str, body: str, url: str = "/", appt_id: int | None = None) -> tuple[int, list[str]]:
+def send_push_to_client(client_contact: str, title: str, body: str, url: str = "/", appt_id: int | None = None) -> None:
     conn = get_db()
-    try:
-        cur = conn.cursor()
-        clean_c = (client_contact or "").strip().lower()
-        if clean_c:
-            cur.execute(
-                "SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' AND LOWER(client_contact) = ? ORDER BY id DESC",
-                (clean_c,),
-            )
-            subs = cur.fetchall()
-            if not subs:
-                cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' ORDER BY id DESC")
-                subs = cur.fetchall()
-        else:
-            cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' ORDER BY id DESC")
-            subs = cur.fetchall()
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    clean_contact = (client_contact or "").strip().lower()
+    if clean_contact:
+        cur.execute(
+            "SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client' AND (LOWER(client_contact) = ? OR client_contact = '')",
+            (clean_contact,),
+        )
+    else:
+        cur.execute("SELECT id, subscription_json FROM push_subscriptions WHERE role = 'client'")
+    subs = cur.fetchall()
+    conn.close()
 
-    return dispatch_web_push(
-        subs,
-        {
-            "title": title,
-            "body": body,
-            "url": url,
-            "appt_id": appt_id,
-            "tag": f"gs-client-{appt_id or int(time.time())}",
-            "actions": [],
-            "timestamp": datetime.now().isoformat(),
-        },
-    )
+    dispatch_web_push(subs, {
+        "title": title,
+        "body": body,
+        "url": url,
+        "appt_id": appt_id,
+        "tag": f"grande-studio-client-{appt_id or 'alert'}",
+        "actions": [],
+        "timestamp": datetime.now().isoformat()
+    })
+
+
+def get_admin_account():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM admin_account WHERE id = 1")
+    acc = cur.fetchone()
+    conn.close()
+    return acc
 
 
 def generate_temp_password(length: int = 12) -> str:
@@ -1012,22 +638,15 @@ def send_reset_email(to_email: str, new_password: str) -> tuple[bool, str]:
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if not is_admin_authenticated():
+        if not session.get("admin_logged_in"):
             return redirect(url_for("admin_login"))
-        session.permanent = True
-        session["admin_logged_in"] = True
         return f(*args, **kwargs)
     return decorated
 
 
 def time_to_min(hhmm: str) -> int:
-    try:
-        parts = str(hhmm or "09:00").split(":")
-        h = int(parts[0])
-        m = int(parts[1]) if len(parts) > 1 else 0
-        return h * 60 + m
-    except Exception:
-        return 540
+    h, m = map(int, hhmm.split(":"))
+    return h * 60 + m
 
 
 def min_to_time(minutes: int) -> str:
@@ -1043,18 +662,16 @@ def get_available_slots(appt_date: str, duration_min: int):
     step_min = int(settings.get("slot_step_min") or SLOT_STEP_MIN)
 
     conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT start_time, end_time FROM appointments
-            WHERE appt_date = ? AND status IN ('Konfirmuar', 'Në Pritje', 'Bllokuar')
-            """,
-            (appt_date,),
-        )
-        busy = [(time_to_min(r["start_time"]), time_to_min(r["end_time"])) for r in cur.fetchall()]
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT start_time, end_time FROM appointments
+        WHERE appt_date = ? AND status IN ('Konfirmuar', 'Në Pritje', 'Bllokuar')
+        """,
+        (appt_date,),
+    )
+    busy = [(time_to_min(r["start_time"]), time_to_min(r["end_time"])) for r in cur.fetchall()]
+    conn.close()
 
     start_m = time_to_min(w_start)
     end_m = time_to_min(w_end)
@@ -1067,7 +684,7 @@ def get_available_slots(appt_date: str, duration_min: int):
         overlap = any(not (cand_end <= b_start or cand_start >= b_end) for b_start, b_end in busy)
         if not overlap:
             slots.append(min_to_time(cand_start))
-        curr += max(15, step_min)
+        curr += step_min
 
     return slots
 
@@ -1077,12 +694,14 @@ def get_banner_artwork_html() -> str:
     ig_avatar_url = prepare_ig_avatar_asset()
 
     if ig_avatar_url:
-        ig_top_html = f'<img src="{esc(ig_avatar_url)}" alt="Instagram Grande Studio" class="ig-banner-avatar">'
+        ig_top_html = f'<img src="{ig_avatar_url}" alt="Instagram Grande Studio" class="ig-banner-avatar">'
     else:
-        ig_top_html = '<div class="ig-banner-avatar ig-fallback-badge" aria-hidden="true">IG</div>'
+        ig_top_html = """
+        <div class="ig-banner-avatar ig-fallback-badge" aria-hidden="true">IG</div>
+        """
 
     if nails_url:
-        nails_bottom_html = f'<img src="{esc(nails_url)}" alt="Grande Studio Nails" class="nails-banner-bottom">'
+        nails_bottom_html = f'<img src="{nails_url}" alt="Grande Studio Nails" class="nails-banner-bottom">'
     else:
         nails_bottom_html = """
         <svg class="nails-banner-bottom" viewBox="0 0 210 68" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -1096,12 +715,12 @@ def get_banner_artwork_html() -> str:
 
 def get_ig_nav_button_html() -> str:
     return f"""
-    <a href="{esc(IG_WEB_URL)}"
-       data-ig-app="{esc(IG_APP_URL)}"
-       data-ig-web="{esc(IG_WEB_URL)}"
+    <a href="{IG_WEB_URL}"
+       data-ig-app="{IG_APP_URL}"
+       data-ig-web="{IG_WEB_URL}"
        onclick="openInstagramProfile(event)"
        class="btn-3d btn-ig-3d"
-       title="Hap Instagramin @{esc(IG_USERNAME)}">
+       title="Hap Instagramin @{IG_USERNAME}">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect>
         <path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path>
@@ -1559,34 +1178,6 @@ BASE_STYLE = """
     color: var(--vishnje);
   }
 
-  .stats-grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 6px;
-    margin-top: 8px;
-  }
-
-  .stat-box {
-    background: #fff8fa;
-    border: 1px solid var(--border);
-    border-radius: 11px;
-    padding: 7px 6px;
-    text-align: center;
-  }
-
-  .stat-num {
-    font-size: 0.95rem;
-    font-weight: 900;
-    color: var(--vishnje-dark);
-  }
-
-  .stat-lbl {
-    font-size: 0.64rem;
-    color: var(--muted);
-    font-weight: 700;
-    margin-top: 1px;
-  }
-
   .cat-filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .cat-chip-3d {
     background: linear-gradient(180deg, #fff, #f9eaee);
@@ -1735,16 +1326,6 @@ BASE_STYLE = """
     display: inline-block;
   }
 
-  .badge-blocked {
-    background: #7f1d1d;
-    color: #fff;
-    font-size: 0.64rem;
-    font-weight: 800;
-    padding: 2px 7px;
-    border-radius: 999px;
-    display: inline-block;
-  }
-
   .live-toast-banner {
     position: fixed;
     top: 14px;
@@ -1774,24 +1355,24 @@ BASE_STYLE = """
     gap: 8px;
   }
 
-  table { width: 100%; border-collapse: collapse; font-size: 0.75rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.76rem; }
   th, td { padding: 7px 5px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
-  th { color: var(--vishnje); font-size: 0.68rem; text-transform: uppercase; }
+  th { color: var(--vishnje); font-size: 0.7rem; text-transform: uppercase; }
 
   .row-is-new { background-color: #fff1f2 !important; }
 
-  .badge { padding: 2px 7px; border-radius: 999px; font-size: 0.67rem; font-weight: 800; display: inline-block; }
+  .badge { padding: 2px 7px; border-radius: 999px; font-size: 0.68rem; font-weight: 800; }
   .b-ok { background: #d3f9d8; color: #1f7a3d; }
   .b-wait { background: #fff3bf; color: #9c6f00; }
   .b-blk { background: #ffe3e3; color: #b41e2d; }
   .b-can { background: #f1f3f5; color: #495057; }
 
   .btn-sm-3d {
-    padding: 6px 8px;
+    padding: 6px 9px;
     border-radius: 8px;
     border: none;
     cursor: pointer;
-    font-size: 0.71rem;
+    font-size: 0.74rem;
     font-weight: 700;
     box-shadow: 0 2px 0 rgba(0,0,0,0.18);
     margin-bottom: 3px;
@@ -1800,9 +1381,6 @@ BASE_STYLE = """
   .btn-sm-3d:active { transform: translateY(2px); box-shadow: none; }
   .btn-del { background: #ffe3e3; color: #b41e2d; }
   .btn-seen { background: #dcfce7; color: #166534; }
-  .btn-blk { background: #fef3c7; color: #92400e; }
-  .btn-unblk { background: #dbeafe; color: #1e40af; }
-  .btn-rst { background: #f3e8ff; color: #6b21a8; }
 
   .edit-svc-box {
     border: 1px solid var(--border);
@@ -1818,19 +1396,15 @@ BASE_STYLE = """
     background: #fff9fb;
     border-radius: 12px;
     padding: 10px 12px;
-    margin-bottom: 10px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
   }
 
-  .client-list-item.blocked-client {
-    border-color: #f87171;
-    background: #fff5f5;
-  }
-
-  .client-action-grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 6px;
-    margin-top: 9px;
+  .client-list-item.selected {
+    border-color: var(--vishnje-bright);
+    background: #fff0f4;
+    box-shadow: 0 3px 10px rgba(184, 29, 61, 0.14);
   }
 
   .modal-overlay {
@@ -1849,9 +1423,9 @@ BASE_STYLE = """
     color: #261217;
     border-radius: 18px;
     padding: 16px;
-    max-width: 375px;
+    max-width: 365px;
     width: 100%;
-    max-height: 84vh;
+    max-height: 82vh;
     overflow-y: auto;
     box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
     border: 1.5px solid #edd3da;
@@ -1869,35 +1443,25 @@ def render_iphone_shell(
     description: str = "Grande Studio — Rezervime online për Thonj, Qerpikë dhe Vetulla. Zgjidhni trajtimin dhe orarin tuaj me një klikim.",
     role_tag: str = "client",
     client_contact_tag: str = "",
-    auto_redirect_admin_on_launch: bool = False,
-    admin_persist_token: str = "",
-    client_persist_token: str = "",
 ) -> str:
     now_clock = datetime.now().strftime("%H:%M")
     base_url = request.url_root.rstrip("/") if request else ""
     canonical_url = f"{base_url}/" if base_url else "/"
     icon_url = f"{base_url}/static/icon-512.png" if base_url else "/static/icon-512.png"
 
-    schema_json = json.dumps(
-        {
-            "@context": "https://schema.org",
-            "@type": "BeautySalon",
-            "name": "Grande Studio",
-            "description": description,
-            "url": canonical_url,
-            "image": icon_url,
-            "sameAs": [IG_WEB_URL],
-            "priceRange": "$$",
-        },
-        ensure_ascii=False,
-    )
+    schema_json = json.dumps({
+        "@context": "https://schema.org",
+        "@type": "BeautySalon",
+        "name": "Grande Studio",
+        "description": description,
+        "url": canonical_url,
+        "image": icon_url,
+        "sameAs": [IG_WEB_URL],
+        "priceRange": "$$"
+    }, ensure_ascii=False)
 
     push_role = "admin" if role_tag == "admin" else "client"
-    safe_client_contact = (client_contact_tag or "").replace("'", "").replace("\\", "").strip().lower()
-    safe_role_tag = (role_tag or "client").replace("'", "").replace("\\", "").strip()
-    auto_redir_js = "true" if auto_redirect_admin_on_launch else "false"
-    safe_admin_tok = (admin_persist_token or "").replace("'", "").replace("\\", "").strip()
-    safe_client_tok = (client_persist_token or "").replace("'", "").replace("\\", "").strip()
+    safe_client_contact = (client_contact_tag or "").replace("'", "").strip().lower()
 
     return f"""
     <!doctype html>
@@ -1905,19 +1469,21 @@ def render_iphone_shell(
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-      <title>{esc(title)}</title>
-      <meta name="description" content="{esc(description)}">
+      <title>{title}</title>
+      <meta name="description" content="{description}">
       <meta name="keywords" content="Grande Studio, thonj, qerpikë, vetulla, manikyr me xhel, lash lift, laminim vetullash, rezervim online, sallon bukurie">
       <meta name="robots" content="index, follow, max-image-preview:large">
-      <link rel="canonical" href="{esc(canonical_url)}">
+      <link rel="canonical" href="{canonical_url}">
 
+      <!-- Open Graph / Social & Google Preview -->
       <meta property="og:type" content="website">
       <meta property="og:site_name" content="Grande Studio">
-      <meta property="og:title" content="{esc(title)}">
-      <meta property="og:description" content="{esc(description)}">
-      <meta property="og:url" content="{esc(canonical_url)}">
-      <meta property="og:image" content="{esc(icon_url)}">
+      <meta property="og:title" content="{title}">
+      <meta property="og:description" content="{description}">
+      <meta property="og:url" content="{canonical_url}">
+      <meta property="og:image" content="{icon_url}">
 
+      <!-- PWA & Mobile App Support (iPhone & Samsung) -->
       <meta name="theme-color" content="#72091d">
       <meta name="mobile-web-app-capable" content="yes">
       <meta name="apple-mobile-web-app-capable" content="yes">
@@ -1927,6 +1493,7 @@ def render_iphone_shell(
       <link rel="icon" type="image/png" href="/static/icon-192.png">
       <link rel="manifest" href="/manifest.json">
 
+      <!-- Structured Data për Google Search -->
       <script type="application/ld+json">{schema_json}</script>
       {BASE_STYLE}
     </head>
@@ -1946,33 +1513,20 @@ def render_iphone_shell(
         </div>
       </div>
       <script>
-        const CURRENT_ROLE = '{safe_role_tag}';
+        const CURRENT_ROLE = '{role_tag}';
         const PUSH_SUB_ROLE = '{push_role}';
         const PUSH_CLIENT_CONTACT = '{safe_client_contact}';
-        const AUTO_REDIRECT_ADMIN = {auto_redir_js};
-        const SERVER_ADMIN_TOK = '{safe_admin_tok}';
-        const SERVER_CLIENT_TOK = '{safe_client_tok}';
 
         try {{
-          if (SERVER_ADMIN_TOK) {{
-            localStorage.setItem('gs_admin_persist_token', SERVER_ADMIN_TOK);
-            document.cookie = 'gs_admin_token=' + encodeURIComponent(SERVER_ADMIN_TOK) + '; path=/; max-age=315360000; SameSite=Lax';
-          }} else if (role_tag === 'admin_login' || role_tag === 'reset') {{
-            const savedAdminTok = localStorage.getItem('gs_admin_persist_token');
-            if (savedAdminTok && !document.cookie.includes('gs_admin_token=')) {{
-              document.cookie = 'gs_admin_token=' + encodeURIComponent(savedAdminTok) + '; path=/; max-age=315360000; SameSite=Lax';
-              window.location.reload();
-            }}
+          if (CURRENT_ROLE === 'admin') {{
+            localStorage.setItem('grande_studio_last_role', 'admin');
+          }} else if (CURRENT_ROLE === 'client_logged_in') {{
+            localStorage.setItem('grande_studio_last_role', 'client');
           }}
-          if (SERVER_CLIENT_TOK) {{
-            localStorage.setItem('gs_client_persist_token', SERVER_CLIENT_TOK);
-            document.cookie = 'gs_client_token=' + encodeURIComponent(SERVER_CLIENT_TOK) + '; path=/; max-age=315360000; SameSite=Lax';
+          if (PUSH_CLIENT_CONTACT) {{
+            localStorage.setItem('gs_client_contact', PUSH_CLIENT_CONTACT);
           }}
         }} catch (e) {{}}
-
-        if (AUTO_REDIRECT_ADMIN && window.location.pathname === '/') {{
-          window.location.replace('/admin');
-        }}
 
         function unlockAudioContext() {{
           try {{
@@ -2018,97 +1572,43 @@ def render_iphone_shell(
           return outputArray;
         }}
 
-        function getActiveClientContact() {{
-          let c = (PUSH_CLIENT_CONTACT || '').trim().toLowerCase();
-          if (!c) {{
-            try {{ c = (localStorage.getItem('gs_client_contact') || '').trim().toLowerCase(); }} catch (e) {{}}
-          }}
-          return c;
-        }}
-
-        async function autoEnableNotificationsAndPush(overrideContact, forcePrompt) {{
+        async function autoEnableNotificationsAndPush(overrideContact) {{
           try {{
-            if (!('Notification' in window)) return {{ ok: false, reason: 'no_notif_api' }};
-
-            if (Notification.permission === 'denied') {{
-              return {{ ok: false, reason: 'denied' }};
+            if (!('Notification' in window)) return;
+            if (Notification.permission === 'default') {{
+              await Notification.requestPermission().catch(() => {{}});
             }}
-
-            if (Notification.permission !== 'granted') {{
-              if (!forcePrompt) return {{ ok: false, reason: 'needs_gesture' }};
-              const perm = await Notification.requestPermission().catch(() => 'denied');
-              if (perm !== 'granted') return {{ ok: false, reason: perm }};
+            if (Notification.permission === 'granted' && 'serviceWorker' in navigator && 'PushManager' in window) {{
+              const reg = await navigator.serviceWorker.ready;
+              const keyRes = await fetch('/api/push/public-key');
+              const keyData = await keyRes.json();
+              if (keyData.publicKey) {{
+                const existingSub = await reg.pushManager.getSubscription();
+                const sub = existingSub || await reg.pushManager.subscribe({{
+                  userVisibleOnly: true,
+                  applicationServerKey: urlBase64ToUint8Array(keyData.publicKey)
+                }});
+                const subJson = sub.toJSON ? sub.toJSON() : JSON.parse(JSON.stringify(sub));
+                const activeContact = (overrideContact || PUSH_CLIENT_CONTACT || localStorage.getItem('gs_client_contact') || '').toLowerCase();
+                if (activeContact) {{
+                  try {{ localStorage.setItem('gs_client_contact', activeContact); }} catch (e) {{}}
+                }}
+                subJson.role = PUSH_SUB_ROLE;
+                subJson.client_contact = activeContact;
+                await fetch('/api/push/subscribe', {{
+                  method: 'POST',
+                  headers: {{ 'Content-Type': 'application/json' }},
+                  body: JSON.stringify(subJson)
+                }}).catch(() => {{}});
+              }}
             }}
-
-            if (!('serviceWorker' in navigator) || !('PushManager' in window)) {{
-              return {{ ok: false, reason: 'no_push_manager' }};
-            }}
-
-            const reg = await navigator.serviceWorker.ready;
-            const keyRes = await fetch('/api/push/public-key');
-            const keyData = await keyRes.json();
-            if (!keyData.publicKey || !keyData.supported) {{
-              return {{ ok: false, reason: 'no_vapid_server' }};
-            }}
-
-            let sub = await reg.pushManager.getSubscription();
-            if (!sub) {{
-              sub = await reg.pushManager.subscribe({{
-                userVisibleOnly: true,
-                applicationServerKey: urlBase64ToUint8Array(keyData.publicKey)
-              }});
-            }}
-
-            const subJson = sub.toJSON ? sub.toJSON() : JSON.parse(JSON.stringify(sub));
-            subJson.role = PUSH_SUB_ROLE;
-            subJson.client_contact = (overrideContact || getActiveClientContact() || '').toLowerCase();
-
-            const saveRes = await fetch('/api/push/subscribe', {{
-              method: 'POST',
-              headers: {{ 'Content-Type': 'application/json' }},
-              body: JSON.stringify(subJson)
-            }});
-            const saveData = await saveRes.json();
-            return {{ ok: Boolean(saveData && saveData.ok), reason: 'subscribed', role: saveData.role }};
-          }} catch (e) {{
-            return {{ ok: false, reason: String(e && e.message ? e.message : e) }};
-          }}
-        }}
-
-        async function testBackgroundLockScreenPush() {{
-          unlockAudioContext();
-          const contactVal = getActiveClientContact();
-          const statusRes = await autoEnableNotificationsAndPush(contactVal, true);
-          if (!statusRes.ok) {{
-            if (statusRes.reason === 'denied') {{
-              alert('Njoftimet janë refuzuar në telefon/shfletues. Hapni Settings/Cilësimet -> Grande Studio -> Notifications dhe aktivizojini.');
-            }} else if (statusRes.reason === 'no_vapid_server') {{
-              alert('Serveri nuk ka aktivizuar Web Push (mangon pywebpush/cryptography). Instaloni në server: pip install pywebpush cryptography');
-            }} else {{
-              alert('Ju lutem lejoni Njoftimet (Allow). Në iPhone, hapni aplikacionin nga ikona në Home Screen.');
-            }}
-            return;
-          }}
-
-          const res = await fetch('/api/push/test', {{
-            method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{ role: PUSH_SUB_ROLE, client_contact: contactVal }})
-          }});
-          const data = await res.json();
-          if (data.ok && Number(data.sent_count || 0) > 0) {{
-            alert(`Njoftimi Push u dërgua te ${{data.sent_count}} pajisje! Mbylleni aplikacionin ose kyçni ekranin (Lock Screen) për ta parë.`);
-          }} else {{
-            const errInfo = (data.errors && data.errors.length) ? ('\\nDetaj: ' + data.errors.join(' | ')) : '';
-            alert((data.error || 'Nuk u dërgua njoftim në sfond.') + errInfo);
-          }}
+          }} catch (e) {{}}
         }}
 
         if ('serviceWorker' in navigator) {{
           window.addEventListener('load', () => {{
-            navigator.serviceWorker.register('/sw.js', {{ scope: '/' }}).then(reg => {{
-              reg.update().catch(() => {{}});
-              autoEnableNotificationsAndPush(getActiveClientContact(), false);
+            navigator.serviceWorker.register('/sw.js', {{ scope: '/' }}).then(() => {{
+              autoEnableNotificationsAndPush();
             }}).catch(() => {{}});
           }});
 
@@ -2121,7 +1621,7 @@ def render_iphone_shell(
         }}
 
         window.addEventListener('DOMContentLoaded', () => {{
-          autoEnableNotificationsAndPush(getActiveClientContact(), false);
+          autoEnableNotificationsAndPush();
         }});
 
         function openInstagramProfile(ev) {{
@@ -2138,9 +1638,10 @@ def render_iphone_shell(
           }}, 650);
         }}
 
+        // Aktivizon audion dhe lejen e njoftimeve në prekjen e parë pa rifreskuar faqen
         document.addEventListener('pointerdown', function() {{
           unlockAudioContext();
-          autoEnableNotificationsAndPush(getActiveClientContact(), false);
+          autoEnableNotificationsAndPush();
         }}, {{ once: true }});
       </script>
     </body>
@@ -2153,20 +1654,6 @@ def apply_security_headers(response):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    max_age_sec = 3650 * 24 * 3600
-    for cookie_name, cookie_val in list(g_pending_cookies.items()):
-        response.set_cookie(
-            cookie_name,
-            cookie_val,
-            max_age=max_age_sec,
-            httponly=True,
-            samesite="Lax",
-            path="/",
-        )
-        g_pending_cookies.pop(cookie_name, None)
-    for del_name in list(g_deleted_cookies):
-        response.delete_cookie(del_name, path="/")
-        g_deleted_cookies.discard(del_name)
     return response
 
 
@@ -2213,14 +1700,14 @@ def manifest():
             "src": "/static/icon-192.png",
             "sizes": "192x192",
             "type": "image/png",
-            "purpose": "any maskable",
+            "purpose": "any maskable"
         },
         {
             "src": "/static/icon-512.png",
             "sizes": "512x512",
             "type": "image/png",
-            "purpose": "any maskable",
-        },
+            "purpose": "any maskable"
+        }
     ]
 
     resp = jsonify({
@@ -2243,8 +1730,9 @@ def manifest():
 @app.route("/sw.js")
 def service_worker():
     js = """
-    const CACHE_NAME = 'grande-studio-v12';
+    const CACHE_NAME = 'grande-studio-v7';
     const CORE_ASSETS = [
+      '/',
       '/manifest.json',
       '/static/icon-192.png',
       '/static/icon-512.png'
@@ -2261,7 +1749,36 @@ def service_worker():
       event.waitUntil(
         caches.keys().then(keys =>
           Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
-        ).then(() => self.clients.claim())
+        )
+      );
+      self.clients.claim();
+    });
+
+    self.addEventListener('pushsubscriptionchange', event => {
+      event.waitUntil(
+        fetch('/api/push/public-key')
+          .then(r => r.json())
+          .then(keyData => {
+            if (!keyData.publicKey) return null;
+            const padding = '='.repeat((4 - keyData.publicKey.length % 4) % 4);
+            const b64 = (keyData.publicKey + padding).replace(/-/g, '+').replace(/_/g, '/');
+            const raw = atob(b64);
+            const arr = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+            return self.registration.pushManager.subscribe({
+              userVisibleOnly: true,
+              applicationServerKey: arr
+            });
+          })
+          .then(newSub => {
+            if (!newSub) return null;
+            return fetch('/api/push/subscribe', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(newSub.toJSON ? newSub.toJSON() : newSub)
+            });
+          })
+          .catch(() => {})
       );
     });
 
@@ -2270,10 +1787,8 @@ def service_worker():
       const url = new URL(event.request.url);
       if (url.origin !== self.location.origin) return;
 
-      if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/admin') || url.pathname === '/') {
-        event.respondWith(
-          fetch(event.request).catch(() => caches.match(event.request))
-        );
+      if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/admin')) {
+        event.respondWith(fetch(event.request));
         return;
       }
 
@@ -2286,93 +1801,52 @@ def service_worker():
             }
             return resp;
           })
-          .catch(() => caches.match(event.request))
+          .catch(() => caches.match(event.request).then(cached => cached || caches.match('/')))
       );
     });
 
     self.addEventListener('push', event => {
       let data = {
-        title: '🔔 Grande Studio',
-        body: 'Keni një njoftim të ri për termin!',
-        url: '/',
+        title: '🔔 Rezervim i Ri — Grande Studio',
+        body: 'Një klient ka bërë një rezervim të ri!',
+        url: '/admin',
         appt_id: null,
         tag: 'grande-studio-booking',
         actions: []
       };
       if (event.data) {
         try {
-          const parsed = event.data.json();
-          if (parsed && typeof parsed === 'object') {
-            data = Object.assign(data, parsed);
-          }
+          data = Object.assign(data, event.data.json());
         } catch (e) {
-          try {
-            const txt = event.data.text();
-            if (txt) data.body = txt;
-          } catch (e2) {}
+          data.body = event.data.text();
         }
       }
 
-      const showTask = (async () => {
-        try {
-          const baseOpts = {
-            body: data.body || 'Keni një njoftim të ri.',
-            icon: '/static/icon-192.png',
-            badge: '/static/icon-192.png',
-            tag: data.tag || ('grande-studio-' + Date.now()),
-            data: {
-              url: data.url || '/',
-              appt_id: data.appt_id || null
-            }
-          };
-          try {
-            await self.registration.showNotification(data.title || 'Grande Studio', Object.assign({}, baseOpts, {
-              vibrate: [400, 150, 400, 150, 500],
-              renotify: true,
-              requireInteraction: true,
-              actions: Array.isArray(data.actions) && data.actions.length ? data.actions : undefined
-            }));
-          } catch (innerErr) {
-            await self.registration.showNotification(data.title || 'Grande Studio', baseOpts);
-          }
-        } catch (outerErr) {}
+      const options = {
+        body: data.body,
+        icon: '/static/icon-192.png',
+        badge: '/static/icon-192.png',
+        vibrate: [400, 150, 400, 150, 500],
+        silent: false,
+        tag: data.tag || 'grande-studio-booking',
+        renotify: true,
+        requireInteraction: true,
+        actions: Array.isArray(data.actions) ? data.actions : [],
+        data: {
+          url: data.url || '/admin',
+          appt_id: data.appt_id || null
+        }
+      };
 
-        try {
-          const clientList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-          for (const client of clientList) {
-            client.postMessage({ type: 'GS_PUSH_RECEIVED', payload: data });
-          }
-        } catch (cErr) {}
-      })();
-
-      event.waitUntil(showTask);
-    });
-
-    self.addEventListener('pushsubscriptionchange', event => {
       event.waitUntil(
-        fetch('/api/push/public-key')
-          .then(res => res.json())
-          .then(keyData => {
-            if (!keyData.publicKey) return;
-            const padding = '='.repeat((4 - keyData.publicKey.length % 4) % 4);
-            const base64 = (keyData.publicKey + padding).replace(/-/g, '+').replace(/_/g, '/');
-            const rawData = atob(base64);
-            const appServerKey = new Uint8Array(rawData.length);
-            for (let i = 0; i < rawData.length; ++i) appServerKey[i] = rawData.charCodeAt(i);
-            return self.registration.pushManager.subscribe({
-              userVisibleOnly: true,
-              applicationServerKey: appServerKey
-            });
+        Promise.all([
+          self.registration.showNotification(data.title, options),
+          self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clientList => {
+            for (const client of clientList) {
+              client.postMessage({ type: 'GS_PUSH_RECEIVED', payload: data });
+            }
           })
-          .then(newSub => {
-            if (!newSub) return;
-            return fetch('/api/push/subscribe', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(newSub)
-            });
-          })
-          .catch(() => {})
+        ])
       );
     });
 
@@ -2380,7 +1854,7 @@ def service_worker():
       const action = event.action;
       const notifData = event.notification.data || {};
       const apptId = notifData.appt_id;
-      const targetUrl = notifData.url || '/';
+      const targetUrl = notifData.url || '/admin';
       event.notification.close();
 
       if ((action === 'confirm_appt' || action === 'cancel_appt') && apptId) {
@@ -2397,6 +1871,7 @@ def service_worker():
                 body: `Statusi i terminit #${apptId} u përditësua në: ${newStatus}.`,
                 icon: '/static/icon-192.png',
                 badge: '/static/icon-192.png',
+                vibrate: [200, 100, 200],
                 tag: 'grande-studio-action-feedback'
               }
             );
@@ -2430,25 +1905,7 @@ def service_worker():
 @app.route("/api/push/public-key")
 def api_push_public_key():
     keys = get_vapid_keys()
-    return jsonify({"publicKey": keys.get("public_key", ""), "supported": bool(HAS_WEBPUSH and keys.get("public_key"))})
-
-
-@app.route("/api/push/status")
-def api_push_status():
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT role, COUNT(*) AS cnt FROM push_subscriptions GROUP BY role")
-        counts = {r["role"]: r["cnt"] for r in cur.fetchall()}
-    finally:
-        conn.close()
-    keys = get_vapid_keys()
-    return jsonify({
-        "has_pywebpush": HAS_WEBPUSH,
-        "has_vapid_keys": bool(keys.get("public_key") and keys.get("private_key")),
-        "admin_subs": counts.get("admin", 0),
-        "client_subs": counts.get("client", 0),
-    })
+    return jsonify({"publicKey": keys.get("public_key", ""), "supported": HAS_WEBPUSH})
 
 
 @app.route("/api/push/subscribe", methods=["POST"])
@@ -2457,50 +1914,25 @@ def api_push_subscribe():
     if not data or not data.get("endpoint"):
         return jsonify({"ok": False, "error": "Abonim i pavlefshëm"}), 400
 
-    req_role = data.get("role")
-    role = "admin" if (is_admin_authenticated() or req_role == "admin") else "client"
+    role = "admin" if (session.get("admin_logged_in") or data.get("role") == "admin") else "client"
     client_contact = (session.get("client_contact") or data.get("client_contact") or "").strip().lower()
 
     conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO push_subscriptions (endpoint, subscription_json, role, client_contact, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(endpoint) DO UPDATE SET
-                subscription_json = excluded.subscription_json,
-                role = excluded.role,
-                client_contact = CASE WHEN excluded.client_contact != '' THEN excluded.client_contact ELSE push_subscriptions.client_contact END
-            """,
-            (data["endpoint"], json.dumps(data), role, client_contact, datetime.now().isoformat()),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO push_subscriptions (endpoint, subscription_json, role, client_contact, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(endpoint) DO UPDATE SET
+            subscription_json = excluded.subscription_json,
+            role = excluded.role,
+            client_contact = CASE WHEN excluded.client_contact != '' THEN excluded.client_contact ELSE push_subscriptions.client_contact END
+        """,
+        (data["endpoint"], json.dumps(data), role, client_contact, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
     return jsonify({"ok": True, "role": role})
-
-
-@app.route("/api/push/test", methods=["POST"])
-def api_push_test():
-    """Dërgon një njoftim testues Push me zë, vibrim dhe banner në Lock Screen."""
-    data = request.get_json(silent=True) or {}
-    role = data.get("role") or ("admin" if is_admin_authenticated() else "client")
-    if role == "admin":
-        sent_count, errors = send_push_to_admins(
-            title="🔔 Test Njoftimi — Grande Studio",
-            body="Njoftimet kur aplikacioni është i mbyllur ose në Lock Screen po funksionojnë!",
-            url="/admin",
-        )
-    else:
-        contact = (session.get("client_contact") or data.get("client_contact") or "").strip().lower()
-        sent_count, errors = send_push_to_client(
-            contact,
-            title="🔔 Test Njoftimi — Grande Studio",
-            body="Do të njoftoheni edhe kur aplikacioni është i mbyllur ose në Lock Screen!",
-            url="/",
-        )
-    return jsonify({"ok": sent_count > 0, "sent_count": sent_count, "errors": errors})
 
 
 @app.route("/api/push/action", methods=["POST"])
@@ -2514,28 +1946,27 @@ def api_push_action():
         return jsonify({"ok": False, "error": "Të dhëna të pavlefshme"}), 400
 
     conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT a.*, s.name AS service_name
-            FROM appointments a
-            LEFT JOIN services s ON a.service_id = s.id
-            WHERE a.id = ?
-            """,
-            (appt_id,),
-        )
-        appt = cur.fetchone()
-        if not appt:
-            return jsonify({"ok": False, "error": "Termini nuk u gjet"}), 404
-
-        cur.execute(
-            "UPDATE appointments SET status = ?, is_new = 0, client_notified = 0 WHERE id = ?",
-            (new_status, appt_id),
-        )
-        conn.commit()
-    finally:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT a.*, s.name AS service_name
+        FROM appointments a
+        LEFT JOIN services s ON a.service_id = s.id
+        WHERE a.id = ?
+        """,
+        (appt_id,),
+    )
+    appt = cur.fetchone()
+    if not appt:
         conn.close()
+        return jsonify({"ok": False, "error": "Termini nuk u gjet"}), 404
+
+    cur.execute(
+        "UPDATE appointments SET status = ?, is_new = 0, client_notified = 0 WHERE id = ?",
+        (new_status, appt_id),
+    )
+    conn.commit()
+    conn.close()
 
     svc_title = appt["service_name"] or "Trajtim"
     if new_status == "Konfirmuar":
@@ -2560,92 +1991,49 @@ def api_push_action():
 
 @app.route("/api/client/status-updates")
 def api_client_status_updates():
-    """Kontrollon nëse ka përditësim statusi për klientin (Konfirmuar / Anuluar) ose reset password të aktivizuar."""
+    """Kontrollon nëse ka përditësim statusi për klientin (Konfirmuar / Anuluar) për zë, vibrim dhe banner."""
     contact = (session.get("client_contact") or request.args.get("contact") or "").strip().lower()
     if not contact:
-        return jsonify({"updates": [], "reset_pending": False, "reset_token": ""})
+        return jsonify({"updates": []})
 
     conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, is_blocked, reset_pending, reset_token FROM clients WHERE LOWER(contact_value) = ?",
-            (contact,),
-        )
-        cli = cur.fetchone()
-        if cli and cli["is_blocked"] == 1:
-            return jsonify({"updates": [], "blocked": True, "reset_pending": False, "reset_token": ""})
-
-        reset_pending = bool(cli and cli["reset_pending"] == 1)
-        reset_token = (cli["reset_token"] if cli else "") or ""
-
-        cur.execute(
-            """
-            SELECT a.id, a.appt_date, a.start_time, a.status, s.name AS service_name
-            FROM appointments a
-            LEFT JOIN services s ON a.service_id = s.id
-            WHERE LOWER(a.client_contact) = ? AND a.client_notified = 0 AND a.status IN ('Konfirmuar', 'Anuluar')
-            ORDER BY a.id DESC
-            """,
-            (contact,),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-        if rows:
-            cur.executemany("UPDATE appointments SET client_notified = 1 WHERE id = ?", [(r["id"],) for r in rows])
-            conn.commit()
-    finally:
-        conn.close()
-
-    return jsonify({
-        "updates": rows,
-        "blocked": False,
-        "reset_pending": reset_pending,
-        "reset_token": reset_token,
-    })
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT a.id, a.appt_date, a.start_time, a.status, s.name AS service_name
+        FROM appointments a
+        LEFT JOIN services s ON a.service_id = s.id
+        WHERE LOWER(a.client_contact) = ? AND a.client_notified = 0 AND a.status IN ('Konfirmuar', 'Anuluar')
+        ORDER BY a.id DESC
+        """,
+        (contact,),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    if rows:
+        cur.executemany("UPDATE appointments SET client_notified = 1 WHERE id = ?", [(r["id"],) for r in rows])
+        conn.commit()
+    conn.close()
+    return jsonify({"updates": rows})
 
 
 @app.route("/api/admin/new-bookings")
 @admin_required
 def api_admin_new_bookings():
     conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT a.id, a.client_name, a.client_phone, a.client_contact, a.appt_date, a.start_time, a.end_time,
-                   a.notes, a.status, a.created_at, s.name AS service_name, s.category, s.price
-            FROM appointments a
-            LEFT JOIN services s ON a.service_id = s.id
-            WHERE a.is_new = 1 AND a.status IN ('Në Pritje', 'Konfirmuar')
-            ORDER BY a.id DESC
-            """
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-        cur.execute("SELECT COUNT(*) AS cnt FROM clients")
-        clients_count = cur.fetchone()["cnt"]
-    finally:
-        conn.close()
-    return jsonify({"count": len(rows), "bookings": rows, "clients_count": clients_count})
-
-
-@app.route("/api/admin/clients")
-@admin_required
-def api_admin_clients():
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, full_name, contact_type, contact_value, client_phone,
-                   is_blocked, reset_pending, reset_sent_via, created_at
-            FROM clients
-            ORDER BY id DESC
-            """
-        )
-        clients_rows = [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
-    return jsonify({"count": len(clients_rows), "clients": clients_rows})
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT a.id, a.client_name, a.client_phone, a.appt_date, a.start_time, a.end_time, a.notes, a.status, a.created_at,
+               s.name AS service_name, s.category
+        FROM appointments a
+        LEFT JOIN services s ON a.service_id = s.id
+        WHERE a.is_new = 1 AND a.status IN ('Në Pritje', 'Konfirmuar')
+        ORDER BY a.id DESC
+        """
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify({"count": len(rows), "bookings": rows})
 
 
 @app.route("/api/admin/auto-save-settings", methods=["POST"])
@@ -2661,19 +2049,17 @@ def api_admin_auto_save_settings():
     hygiene_note = (data.get("hygiene_note") or "").strip()
 
     conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE salon_settings
-            SET work_start = ?, work_end = ?, slot_step_min = ?, hygiene_note = ?, updated_at = ?
-            WHERE id = 1
-            """,
-            (w_start, w_end, max(15, step_min), hygiene_note, datetime.now().isoformat()),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE salon_settings
+        SET work_start = ?, work_end = ?, slot_step_min = ?, hygiene_note = ?, updated_at = ?
+        WHERE id = 1
+        """,
+        (w_start, w_end, max(15, step_min), hygiene_note, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
     return jsonify({"ok": True, "saved_at": datetime.now().strftime("%H:%M:%S")})
 
 
@@ -2685,13 +2071,10 @@ def api_slots():
         return jsonify({"slots": []})
 
     conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT duration_min FROM services WHERE id = ?", (service_id,))
-        row = cur.fetchone()
-    finally:
-        conn.close()
-
+    cur = conn.cursor()
+    cur.execute("SELECT duration_min FROM services WHERE id = ?", (service_id,))
+    row = cur.fetchone()
+    conn.close()
     if not row:
         return jsonify({"slots": []})
 
@@ -2699,37 +2082,25 @@ def api_slots():
     return jsonify({"slots": slots, "duration_min": row["duration_min"]})
 
 
-@app.route("/client/logout")
-def client_logout():
-    clear_client_session_keys()
-    return redirect(url_for("index"))
-
-
 @app.route("/", methods=["GET", "POST"])
 def index():
     init_db()
-    is_admin_viewing = is_admin_authenticated()
-
-    if is_admin_viewing and request.method == "GET" and request.args.get("stay_client") != "1":
+    if session.get("admin_logged_in"):
         return redirect(url_for("admin_panel"))
 
-    if session.get("client_logged_in") and is_client_blocked_in_db(
-        contact_val=session.get("client_contact", ""),
-        client_id=session.get("client_id"),
-    ):
-        clear_client_session_keys()
-
-    try:
-        prepare_clean_nails_asset()
-        prepare_ig_avatar_asset()
-        prepare_app_icons()
-        get_vapid_keys()
-    except Exception as e:
-        print(f"[ASSETS] Paralajmërim gjatë përgatitjes së aseteve: {e}")
-
+    prepare_clean_nails_asset()
+    prepare_ig_avatar_asset()
+    prepare_app_icons()
     banner_art_html = get_banner_artwork_html()
     ig_nav_html = get_ig_nav_button_html()
     settings = get_salon_settings()
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM services ORDER BY CASE category WHEN 'Kombinim' THEN 1 WHEN 'Thonj' THEN 2 WHEN 'Qerpikë' THEN 3 ELSE 4 END, id"
+    )
+    services = cur.fetchall()
 
     msg = None
     msg_type = "ok"
@@ -2739,274 +2110,204 @@ def index():
 
     reset_token_param = (request.args.get("reset_token") or "").strip()
     pending_reset_client = None
+
+    if reset_token_param:
+        cur.execute("SELECT * FROM clients WHERE reset_pending = 1 AND reset_token = ?", (reset_token_param,))
+        pending_reset_client = cur.fetchone()
+    elif session.get("client_id"):
+        cur.execute("SELECT * FROM clients WHERE id = ? AND reset_pending = 1", (session["client_id"],))
+        pending_reset_client = cur.fetchone()
+
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM services ORDER BY CASE category WHEN 'Kombinim' THEN 1 WHEN 'Thonj' THEN 2 WHEN 'Qerpikë' THEN 3 ELSE 4 END, id"
-        )
-        services = cur.fetchall()
+    if request.method == "POST":
+        post_mode = request.form.get("post_mode", "booking")
 
-        if reset_token_param:
-            cur.execute("SELECT * FROM clients WHERE reset_pending = 1 AND reset_token = ? AND is_blocked = 0", (reset_token_param,))
-            pending_reset_client = cur.fetchone()
-        elif session.get("client_id"):
-            cur.execute("SELECT * FROM clients WHERE id = ? AND reset_pending = 1 AND is_blocked = 0", (session["client_id"],))
-            pending_reset_client = cur.fetchone()
+        if post_mode == "client_auth":
+            raw_contact = request.form.get("auth_contact", "").strip()
+            raw_password = request.form.get("auth_password", "")
+            full_name_in = request.form.get("auth_full_name", "").strip()
+            phone_in = request.form.get("auth_phone", "").strip()
+            c_type, c_val = normalize_contact_identifier(raw_contact)
 
-        if request.method == "POST":
-            post_mode = request.form.get("post_mode", "booking")
-
-            try:
-                if post_mode == "client_login":
-                    raw_contact = (request.form.get("login_contact") or "").strip()
-                    raw_password = request.form.get("login_password") or ""
-                    _, c_val = normalize_contact_identifier(raw_contact)
-
-                    if not c_val or not raw_password:
-                        msg = "Ju lutem shkruani Email-in ose Instagram-in dhe passwordin tuaj."
-                        msg_type = "err"
-                    else:
-                        cur.execute("SELECT * FROM clients WHERE LOWER(contact_value) = ?", (c_val.lower(),))
-                        existing_client = cur.fetchone()
-                        if not existing_client:
-                            msg = "Ky Email ose Instagram nuk është regjistruar ende. Përdorni panelin 'Regjistrohu si Klient i Ri'."
-                            msg_type = "err"
-                        elif existing_client["is_blocked"] == 1:
-                            msg = "Llogaria juaj është bllokuar nga admini dhe nuk keni qasje në aplikacion."
-                            msg_type = "err"
-                        elif existing_client["reset_pending"] == 1:
-                            pending_reset_client = existing_client
-                            msg = "Admini ka aktivizuar rivendosjen e passwordit. Shënoni passwordin e ri."
-                            msg_type = "ok"
-                        elif check_password_hash(existing_client["password_hash"], raw_password):
-                            session["client_logged_in"] = True
-                            session["client_id"] = existing_client["id"]
-                            session["client_contact"] = existing_client["contact_value"]
-                            session["client_contact_type"] = existing_client["contact_type"]
-                            session["client_name"] = existing_client["full_name"] or existing_client["contact_value"]
-                            session["client_phone"] = existing_client["client_phone"] or ""
-                            issue_persistent_login("client", int(existing_client["id"]))
-                            msg = f"Mirësevini, {existing_client['contact_value']}! Tani mund të rezervoni terminin tuaj."
-                            msg_type = "ok"
-                        else:
-                            msg = "Passwordi është i pasaktë. Nëse e keni harruar, kontaktoni adminin për 'Reseto Passwordin'."
-                            msg_type = "err"
-                    active_tab = "book"
-
-                elif post_mode == "client_register":
-                    full_name_in = " ".join((request.form.get("reg_full_name") or "").split())
-                    raw_contact = (request.form.get("reg_contact") or "").strip()
-                    phone_in = " ".join((request.form.get("reg_phone") or "").split())
-                    raw_password = request.form.get("reg_password") or ""
-                    c_type, c_val = normalize_contact_identifier(raw_contact)
-
-                    if not full_name_in:
-                        msg = "Ju lutem shkruani Emrin dhe Mbiemrin tuaj."
-                        msg_type = "err"
-                    elif not c_val:
-                        msg = "Ju lutem shkruani një Email ose Instagram të vlefshëm."
-                        msg_type = "err"
-                    elif not phone_in:
-                        msg = "Ju lutem shkruani numrin e telefonit."
-                        msg_type = "err"
-                    elif len(raw_password) < 4:
-                        msg = "Passwordi duhet të ketë të paktën 4 karaktere."
-                        msg_type = "err"
-                    else:
-                        cur.execute("SELECT id, contact_value, is_blocked FROM clients WHERE LOWER(contact_value) = ?", (c_val.lower(),))
-                        already = cur.fetchone()
-                        if already and already["is_blocked"] == 1:
-                            msg = "Ky profil është i bllokuar nga admini dhe nuk mund të regjistrohet ose të hyjë në aplikacion."
-                            msg_type = "err"
-                        elif already:
-                            msg = f"Llogaria {already['contact_value']} ekziston tashmë. Ju lutem kyçuni te paneli i Kyçjes."
-                            msg_type = "err"
-                        else:
-                            now_iso = datetime.now().isoformat()
-                            pwd_hash = generate_password_hash(raw_password)
-                            cur.execute(
-                                """
-                                INSERT INTO clients (
-                                    full_name, contact_type, contact_value, client_phone,
-                                    password_hash, is_blocked, reset_pending, reset_token, reset_sent_via,
-                                    created_at, updated_at
-                                )
-                                VALUES (?, ?, ?, ?, ?, 0, 0, '', '', ?, ?)
-                                """,
-                                (full_name_in, c_type, c_val, phone_in, pwd_hash, now_iso, now_iso),
-                            )
-                            new_client_id = cur.lastrowid
-                            conn.commit()
-                            session["client_logged_in"] = True
-                            session["client_id"] = new_client_id
-                            session["client_contact"] = c_val
-                            session["client_contact_type"] = c_type
-                            session["client_name"] = full_name_in
-                            session["client_phone"] = phone_in
-                            issue_persistent_login("client", int(new_client_id))
-                            msg = f"Regjistrimi u krye me sukses për {full_name_in} ({c_val})! Tani mund të caktoni terminin tuaj."
-                            msg_type = "ok"
-                    active_tab = "book"
-
-                elif post_mode == "client_set_new_password":
-                    target_client_id = request.form.get("reset_client_id", type=int)
-                    target_token = (request.form.get("reset_token") or "").strip()
-                    new_pwd = request.form.get("new_client_password") or ""
-                    conf_pwd = request.form.get("confirm_client_password") or ""
-
-                    cur.execute("SELECT * FROM clients WHERE id = ? AND reset_pending = 1 AND is_blocked = 0", (target_client_id,))
-                    target_cli = cur.fetchone()
-                    if not target_cli or (target_cli["reset_token"] and target_token != target_cli["reset_token"]):
-                        msg = "Kërkesa për ndërrimin e passwordit nuk është e vlefshme."
-                        msg_type = "err"
-                    elif len(new_pwd) < 4:
-                        pending_reset_client = target_cli
-                        msg = "Passwordi i ri duhet të ketë të paktën 4 karaktere."
-                        msg_type = "err"
-                    elif new_pwd != conf_pwd:
-                        pending_reset_client = target_cli
-                        msg = "Passwordet nuk përputhen. Shënoni sërish passwordin e ri."
-                        msg_type = "err"
-                    else:
-                        cur.execute(
-                            """
-                            UPDATE clients
-                            SET password_hash = ?, reset_pending = 0, reset_token = '', updated_at = ?
-                            WHERE id = ?
-                            """,
-                            (generate_password_hash(new_pwd), datetime.now().isoformat(), target_cli["id"]),
-                        )
-                        conn.commit()
-                        pending_reset_client = None
-                        session["client_logged_in"] = True
-                        session["client_id"] = target_cli["id"]
-                        session["client_contact"] = target_cli["contact_value"]
-                        session["client_contact_type"] = target_cli["contact_type"]
-                        session["client_name"] = target_cli["full_name"] or target_cli["contact_value"]
-                        session["client_phone"] = target_cli["client_phone"] or ""
-                        issue_persistent_login("client", int(target_cli["id"]))
-                        msg = f"Passwordi i ri u ruajt dhe jeni kyçur automatikisht si {target_cli['contact_value']}!"
+            if not c_val or len(raw_password) < 4:
+                msg = "Ju lutem shkruani Email-in ose Instagram-in dhe një password (të paktën 4 karaktere)."
+                msg_type = "err"
+            else:
+                cur.execute("SELECT * FROM clients WHERE contact_value = ?", (c_val,))
+                existing_client = cur.fetchone()
+                if existing_client:
+                    if existing_client["reset_pending"] == 1:
+                        pending_reset_client = existing_client
+                        msg = "Admini ka dërguar rivendosje të passwordit. Ju lutem shënoni passwordin e ri."
                         msg_type = "ok"
+                    elif check_password_hash(existing_client["password_hash"], raw_password):
+                        session.permanent = True
+                        session["client_logged_in"] = True
+                        session["client_id"] = existing_client["id"]
+                        session["client_contact"] = existing_client["contact_value"]
+                        session["client_contact_type"] = existing_client["contact_type"]
+                        session["client_name"] = existing_client["full_name"] or existing_client["contact_value"]
+                        session["client_phone"] = existing_client["client_phone"] or ""
+                        msg = f"Mirësevini, {existing_client['contact_value']}! Jeni të kyçur në llogarinë tuaj."
+                        msg_type = "ok"
+                    else:
+                        msg = "Passwordi është i pasaktë. Nëse e keni harruar, kontaktoni adminin për 'Refresko Password'."
+                        msg_type = "err"
+                else:
+                    now_iso = datetime.now().isoformat()
+                    display_name = full_name_in or c_val
+                    cur.execute(
+                        """
+                        INSERT INTO clients (full_name, contact_type, contact_value, client_phone, password_hash, reset_pending, reset_token, reset_sent_via, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, 0, '', '', ?, ?)
+                        """,
+                        (display_name, c_type, c_val, phone_in, generate_password_hash(raw_password), now_iso, now_iso),
+                    )
+                    new_client_id = cur.lastrowid
+                    conn.commit()
+                    session.permanent = True
+                    session["client_logged_in"] = True
+                    session["client_id"] = new_client_id
+                    session["client_contact"] = c_val
+                    session["client_contact_type"] = c_type
+                    session["client_name"] = display_name
+                    session["client_phone"] = phone_in
+                    msg = f"Llogaria u regjistrua dhe u kyçët me {c_val}!"
+                    msg_type = "ok"
+            active_tab = "book"
+
+        elif post_mode == "client_set_new_password":
+            target_client_id = request.form.get("reset_client_id", type=int)
+            target_token = request.form.get("reset_token", "").strip()
+            new_pwd = request.form.get("new_client_password", "")
+            conf_pwd = request.form.get("confirm_client_password", "")
+
+            cur.execute("SELECT * FROM clients WHERE id = ? AND reset_pending = 1", (target_client_id,))
+            target_cli = cur.fetchone()
+            if not target_cli or (target_cli["reset_token"] and target_token != target_cli["reset_token"]):
+                msg = "Kërkesa për ndërrimin e passwordit nuk është e vlefshme."
+                msg_type = "err"
+            elif len(new_pwd) < 4:
+                pending_reset_client = target_cli
+                msg = "Passwordi i ri duhet të ketë të paktën 4 karaktere."
+                msg_type = "err"
+            elif new_pwd != conf_pwd:
+                pending_reset_client = target_cli
+                msg = "Passwordet nuk përputhen. Shënoni sërish passwordin e ri."
+                msg_type = "err"
+            else:
+                cur.execute(
+                    """
+                    UPDATE clients
+                    SET password_hash = ?, reset_pending = 0, reset_token = '', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (generate_password_hash(new_pwd), datetime.now().isoformat(), target_cli["id"]),
+                )
+                conn.commit()
+                pending_reset_client = None
+                session.permanent = True
+                session["client_logged_in"] = True
+                session["client_id"] = target_cli["id"]
+                session["client_contact"] = target_cli["contact_value"]
+                session["client_contact_type"] = target_cli["contact_type"]
+                session["client_name"] = target_cli["full_name"] or target_cli["contact_value"]
+                session["client_phone"] = target_cli["client_phone"] or ""
+                msg = f"Passwordi i ri u ruajt dhe jeni kyçur automatikisht si {target_cli['contact_value']}!"
+                msg_type = "ok"
+            active_tab = "book"
+
+        else:
+            raw_contact_book = (request.form.get("client_contact") or session.get("client_contact") or "").strip()
+            _, norm_contact_book = normalize_contact_identifier(raw_contact_book)
+            client_name = (request.form.get("client_name") or session.get("client_name") or norm_contact_book).strip()
+            client_phone = (request.form.get("client_phone") or session.get("client_phone") or "").strip()
+            service_id = request.form.get("service_id", type=int)
+            appt_date = request.form.get("appt_date", "").strip()
+            start_time = request.form.get("start_time", "").strip()
+            notes = request.form.get("notes", "").strip()
+
+            cur.execute("SELECT * FROM services WHERE id = ?", (service_id,))
+            svc = cur.fetchone()
+
+            if not (norm_contact_book or client_name) or not client_phone or not svc or not appt_date or not start_time:
+                msg = "Ju lutem plotësoni të gjitha fushat e detyrueshme dhe zgjidhni një orar."
+                msg_type = "err"
+                active_tab = "book"
+            else:
+                valid_slots = get_available_slots(appt_date, svc["duration_min"])
+                if start_time not in valid_slots:
+                    msg = "Ky orar nuk është më i lirë ose nuk mjafton për kohëzgjatjen e shërbimit."
+                    msg_type = "err"
+                    active_tab = "book"
+                else:
+                    end_time = min_to_time(time_to_min(start_time) + svc["duration_min"])
+                    display_client_label = f"{client_name} ({norm_contact_book})" if norm_contact_book and norm_contact_book not in client_name else client_name
+                    cur.execute(
+                        """
+                        INSERT INTO appointments
+                        (client_name, client_phone, client_contact, service_id, appt_date, start_time, end_time, notes, status, is_new, client_notified, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Në Pritje', 1, 1, ?)
+                        """,
+                        (
+                            display_client_label,
+                            client_phone,
+                            norm_contact_book,
+                            service_id,
+                            appt_date,
+                            start_time,
+                            end_time,
+                            notes,
+                            datetime.now().isoformat(),
+                        ),
+                    )
+                    new_appt_id = cur.lastrowid
+                    if norm_contact_book:
+                        session["client_contact"] = norm_contact_book
+                    if session.get("client_id"):
+                        cur.execute(
+                            "UPDATE clients SET full_name = ?, client_phone = ?, updated_at = ? WHERE id = ?",
+                            (client_name, client_phone, datetime.now().isoformat(), session["client_id"]),
+                        )
+                    conn.commit()
+
+                    send_push_to_admins(
+                        title=f"🔔 Kërkesë për Termin: {display_client_label}",
+                        body=f"{svc['name']} • Data: {appt_date} në {start_time} • Tel: {client_phone}",
+                        url="/admin",
+                        appt_id=new_appt_id,
+                    )
+
+                    msg = f"Kërkesa për termin u dërgua për {display_client_label} më {appt_date} në ora {start_time} ({svc['name']}). Do të njoftoheni sapo admini ta konfirmojë!"
+                    msg_type = "ok"
                     active_tab = "book"
 
-                else:
-                    if not (session.get("client_logged_in") or is_admin_viewing):
-                        msg = "Për të rezervuar termin, duhet fillimisht të regjistroheni ose të kyçeni në llogarinë tuaj!"
-                        msg_type = "err"
-                        active_tab = "book"
-                    else:
-                        raw_contact_book = (session.get("client_contact") or request.form.get("client_contact") or "").strip()
-                        _, norm_contact_book = normalize_contact_identifier(raw_contact_book)
-                        if session.get("client_logged_in") and is_client_blocked_in_db(norm_contact_book, session.get("client_id")):
-                            clear_client_session_keys()
-                            msg = "Llogaria juaj është bllokuar nga admini dhe nuk mund të bëni rezervime."
-                            msg_type = "err"
-                            active_tab = "book"
-                        else:
-                            client_name = (request.form.get("client_name") or session.get("client_name") or norm_contact_book).strip()
-                            client_phone = (request.form.get("client_phone") or session.get("client_phone") or "").strip()
-                            service_id = request.form.get("service_id", type=int)
-                            appt_date = (request.form.get("appt_date") or "").strip()
-                            start_time = (request.form.get("start_time") or "").strip()
-                            notes = (request.form.get("notes") or "").strip()
+    saved_client_contact = session.get("client_contact", "")
+    saved_client_name = session.get("client_name", "")
+    saved_client_phone = session.get("client_phone", "")
+    is_client_logged_in = bool(session.get("client_logged_in") and saved_client_contact)
+    role_tag = "client_logged_in" if is_client_logged_in else "client"
 
-                            cur.execute("SELECT * FROM services WHERE id = ?", (service_id,))
-                            svc = cur.fetchone()
+    client_appts = []
+    if saved_client_contact:
+        cur.execute(
+            """
+            SELECT a.*, s.name AS service_name, s.price
+            FROM appointments a
+            LEFT JOIN services s ON a.service_id = s.id
+            WHERE LOWER(a.client_contact) = ?
+            ORDER BY a.appt_date DESC, a.start_time DESC
+            LIMIT 5
+            """,
+            (saved_client_contact.lower(),),
+        )
+        client_appts = cur.fetchall()
 
-                            if not (norm_contact_book or client_name) or not client_phone or not svc or not appt_date or not start_time:
-                                msg = "Ju lutem plotësoni të gjitha fushat e detyrueshme dhe zgjidhni një orar."
-                                msg_type = "err"
-                                active_tab = "book"
-                            else:
-                                valid_slots = get_available_slots(appt_date, svc["duration_min"])
-                                if start_time not in valid_slots:
-                                    msg = "Ky orar nuk është më i lirë ose nuk mjafton për kohëzgjatjen e shërbimit."
-                                    msg_type = "err"
-                                    active_tab = "book"
-                                else:
-                                    end_time = min_to_time(time_to_min(start_time) + svc["duration_min"])
-                                    display_client_label = (
-                                        f"{client_name} ({norm_contact_book})"
-                                        if norm_contact_book and norm_contact_book not in client_name
-                                        else client_name
-                                    )
-                                    cur.execute(
-                                        """
-                                        INSERT INTO appointments
-                                        (client_name, client_phone, client_contact, service_id, appt_date, start_time, end_time, notes, status, is_new, client_notified, created_at)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Në Pritje', 1, 1, ?)
-                                        """,
-                                        (
-                                            display_client_label,
-                                            client_phone,
-                                            norm_contact_book,
-                                            service_id,
-                                            appt_date,
-                                            start_time,
-                                            end_time,
-                                            notes,
-                                            datetime.now().isoformat(),
-                                        ),
-                                    )
-                                    new_appt_id = cur.lastrowid
-                                    if session.get("client_id"):
-                                        cur.execute(
-                                            "UPDATE clients SET full_name = ?, client_phone = ?, updated_at = ? WHERE id = ?",
-                                            (client_name, client_phone, datetime.now().isoformat(), session["client_id"]),
-                                        )
-                                        session["client_phone"] = client_phone
-                                    conn.commit()
-
-                                    send_push_to_admins(
-                                        title=f"🔔 Kërkesë për Termin: {display_client_label}",
-                                        body=f"{svc['name']} • {appt_date} ({start_time}-{end_time}) • Tel: {client_phone}",
-                                        url="/admin",
-                                        appt_id=new_appt_id,
-                                    )
-
-                                    msg = f"Kërkesa për termin u dërgua për {display_client_label} më {appt_date} në ora {start_time} ({svc['name']}). Do të njoftoheni sapo admini ta konfirmojë!"
-                                    msg_type = "ok"
-                                    active_tab = "book"
-
-            except sqlite3.IntegrityError:
-                conn.rollback()
-                msg = "Ky Email ose Instagram është i regjistruar tashmë."
-                msg_type = "err"
-            except Exception as exc:
-                conn.rollback()
-                print(f"[INDEX POST ERROR] {exc}")
-                msg = f"Ndodhi një gabim gjatë përpunimit të kërkesës: {exc}"
-                msg_type = "err"
-
-        saved_client_contact = session.get("client_contact", "")
-        saved_client_name = session.get("client_name", "")
-        saved_client_phone = session.get("client_phone", "")
-        is_client_logged_in = bool(session.get("client_logged_in") and saved_client_contact)
-        can_book_now = is_client_logged_in or is_admin_viewing
-        role_tag = "admin" if is_admin_viewing else ("client_logged_in" if is_client_logged_in else "client")
-
-        client_appts = []
-        if saved_client_contact:
-            cur.execute(
-                """
-                SELECT a.*, s.name AS service_name, s.price
-                FROM appointments a
-                LEFT JOIN services s ON a.service_id = s.id
-                WHERE LOWER(a.client_contact) = ?
-                ORDER BY a.appt_date DESC, a.start_time DESC
-                LIMIT 5
-                """,
-                (saved_client_contact.lower(),),
-            )
-            client_appts = cur.fetchall()
-    finally:
-        conn.close()
+    conn.close()
 
     service_options = "\n".join(
-        f'<option value="{s["id"]}" data-cat="{esc(s["category"])}" data-dur="{s["duration_min"]}">[{esc(s["category"])}] {esc(s["name"])} — {s["duration_min"]} min ({s["price"]:.0f}€)</option>'
+        f'<option value="{s["id"]}" data-cat="{html.escape(s["category"], quote=True)}" data-dur="{s["duration_min"]}">[{html.escape(s["category"])}] {html.escape(s["name"])} — {s["duration_min"]} min ({s["price"]:.0f}€)</option>'
         for s in services
     )
 
@@ -3015,7 +2316,7 @@ def index():
         cls = "alert-ok" if msg_type == "ok" else "alert-err"
         alert_html = f"""
         <div class="alert {cls}" id="clientAlertBox">
-          <span>{esc(msg)}</span>
+          <span>{html.escape(msg)}</span>
           <button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button>
         </div>
         """
@@ -3029,10 +2330,10 @@ def index():
             items += f"""
             <div style="display:flex; justify-content:space-between; align-items:center; padding:7px 0; border-bottom:1px solid var(--border); font-size:0.78rem;">
               <div>
-                <b>{esc(ca['service_name'] or 'Trajtim')}</b><br>
-                <span style="color:var(--muted);">📅 {esc(ca['appt_date'])} • ⏰ {esc(ca['start_time'])}</span>
+                <b>{html.escape(ca['service_name'] or 'Trajtim')}</b><br>
+                <span style="color:var(--muted);">📅 {html.escape(ca['appt_date'])} • ⏰ {html.escape(ca['start_time'])}</span>
               </div>
-              <span class="badge {b_cls}">{esc(st)}</span>
+              <span class="badge {b_cls}">{html.escape(st)}</span>
             </div>
             """
         client_appts_html = f"""
@@ -3051,170 +2352,70 @@ def index():
               <b style="color:#72091d; font-size:1rem;">🔐 Shëno passwordin e ri</b>
             </div>
             <p style="margin:0 0 10px; font-size:0.78rem; color:var(--muted); line-height:1.45;">
-              Llogaria: <b>{esc(pending_reset_client['contact_value'])}</b><br>
-              Shënoni passwordin e ri për të rikthyer qasjen në aplikacion.
+              Llogaria: <b>{html.escape(pending_reset_client['contact_value'])}</b><br>
+              Shënoni passwordin e ri për të hyrë në llogarinë tuaj.
             </p>
             <form method="POST">
               <input type="hidden" name="post_mode" value="client_set_new_password">
               <input type="hidden" name="reset_client_id" value="{pending_reset_client['id']}">
-              <input type="hidden" name="reset_token" value="{esc(pending_reset_client['reset_token'])}">
+              <input type="hidden" name="reset_token" value="{html.escape(pending_reset_client['reset_token'], quote=True)}">
               <label for="new_client_password">Shëno passwordin e ri</label>
               <input type="password" name="new_client_password" id="new_client_password" placeholder="Shkruani passwordin e ri..." required autofocus>
               <label for="confirm_client_password">Konfirmo passwordin e ri</label>
               <input type="password" name="confirm_client_password" id="confirm_client_password" placeholder="Përsëritni passwordin e ri..." required>
               <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px;">
-                Ruaj Passwordin e Ri &amp; Hyj në App
+                Ruaj Passwordin e Ri &amp; Kyçu
               </button>
             </form>
           </div>
         </div>
         """
 
-    admin_viewing_banner = ""
-    if is_admin_viewing:
-        admin_viewing_banner = f"""
-        <div class="card-3d" style="padding:10px 12px; background:#fff0f4; border:1.5px solid var(--vishnje-bright);">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
-            <span style="font-size:0.76rem; font-weight:800; color:var(--vishnje-dark);">
-              🛡️ Jeni të kyçur si Admin (Pamja e Klientit)
-            </span>
-            <a href="{url_for('admin_panel')}" class="btn-3d btn-vishnje-3d" style="padding:6px 10px; font-size:0.72rem; white-space:nowrap;">
-              Kthehu në Admin →
-            </a>
-          </div>
-        </div>
-        """
-
+    client_login_card = ""
     if is_client_logged_in:
-        client_auth_panels_html = f"""
+        client_login_card = f"""
         <div class="card-3d" style="padding:10px 12px; background:#fff9fb;">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
-            <div style="font-size:0.78rem; color:var(--vishnje-dark);">
-              <b>👤 Klienti i kyçur:</b> {esc(saved_client_contact)}
-            </div>
-            <div style="display:flex; gap:5px;">
-              <button type="button" onclick="testBackgroundLockScreenPush()" class="btn-sm-3d btn-seen" style="font-size:0.68rem;">🔔 Lock Screen</button>
-              <a href="{url_for('client_logout')}" class="btn-sm-3d btn-del" style="text-decoration:none; font-size:0.68rem;">Dil</a>
-            </div>
+          <div style="font-size:0.78rem; color:var(--vishnje-dark);">
+            <b>👤 Klienti i kyçur:</b> {html.escape(saved_client_contact)}
           </div>
-          <div style="font-size:0.7rem; color:var(--muted); margin-top:4px;">
-            Shtyp <b>🔔 Lock Screen</b> për të aktivizuar dhe testuar njoftimet kur aplikacioni është i mbyllur.
+          <div style="font-size:0.7rem; color:var(--muted); margin-top:2px;">
+            Njoftimet me zë, vibrim dhe banner janë aktive për statusin e terminit tuaj.
           </div>
         </div>
         """
     else:
-        client_auth_panels_html = """
-        <div class="card-3d" style="padding:13px; border: 1.5px solid var(--vishnje-bright);">
-          <h2>🔐 Kyçu (Klient i Regjistruar Më Herët)</h2>
-          <p style="margin:0 0 8px; font-size:0.76rem; color:var(--muted); line-height:1.35;">
-            Jeni regjistruar më herët? Kyçuni me <b>Email</b> ose <b>Instagram</b> dhe <b>Password</b>.
+        client_login_card = f"""
+        <div class="card-3d" style="padding:12px;">
+          <h2>👤 Kyçja / Regjistrimi i Klientit</h2>
+          <p style="margin:0 0 8px; font-size:0.76rem; color:var(--muted);">
+            Kyçuni me <b>Email</b> ose <b>Instagram</b> dhe <b>Password</b>. Pas kyçjes, merrni njoftime automatike kur termini konfirmohet.
           </p>
           <form method="POST">
-            <input type="hidden" name="post_mode" value="client_login">
+            <input type="hidden" name="post_mode" value="client_auth">
             <input type="hidden" name="active_tab" value="book">
 
-            <label for="login_contact">Email ose Instagram *</label>
-            <input type="text" name="login_contact" id="login_contact" placeholder="p.sh. sara@email.com ose @sara.beauty" required>
+            <label for="auth_contact">Email ose Instagram</label>
+            <input type="text" name="auth_contact" id="auth_contact" placeholder="p.sh. sara@email.com ose @sara.beauty" required>
 
-            <label for="login_password">Password *</label>
-            <input type="password" name="login_password" id="login_password" placeholder="Shkruani passwordin..." required>
+            <label for="auth_password">Password</label>
+            <input type="password" name="auth_password" id="auth_password" placeholder="Shkruani passwordin..." required>
 
-            <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px; padding:10px 12px; font-size:0.86rem;">
-              🔑 Kyçu
-            </button>
-          </form>
-        </div>
-
-        <div class="card-3d" style="padding:13px; border: 1.5px solid var(--border);">
-          <h2>✨ Regjistrohu si Klient i Ri</h2>
-          <p style="margin:0 0 8px; font-size:0.76rem; color:var(--muted); line-height:1.35;">
-            Krijo llogari të re te <b>Grande Studio</b> për të rezervuar terminin tuaj.
-          </p>
-          <form method="POST">
-            <input type="hidden" name="post_mode" value="client_register">
-            <input type="hidden" name="active_tab" value="book">
-
-            <label for="reg_full_name">Emri &amp; Mbiemri *</label>
-            <input type="text" name="reg_full_name" id="reg_full_name" placeholder="p.sh. Sara Berisha" required>
-
-            <label for="reg_contact">Email ose Instagram *</label>
-            <input type="text" name="reg_contact" id="reg_contact" placeholder="p.sh. sara@email.com ose @sara.beauty" required>
-
-            <label for="reg_phone">Numri i Telefonit *</label>
-            <input type="tel" name="reg_phone" id="reg_phone" placeholder="p.sh. +383 44 ..." required>
-
-            <label for="reg_password">Password *</label>
-            <input type="password" name="reg_password" id="reg_password" placeholder="Të paktën 4 karaktere..." required>
-
-            <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:12px; padding:10px 12px; font-size:0.86rem;">
-              📝 Regjistrohu
-            </button>
-          </form>
-        </div>
-        """
-
-    booking_form_card_html = ""
-    if can_book_now:
-        contact_readonly_attr = "readonly" if is_client_logged_in else ""
-        booking_form_card_html = f"""
-          <div class="card-3d">
-            <h2>Rezervo Terminin Tënd</h2>
-
-            <label>Filtro sipas Zonës</label>
-            <div class="cat-filter-row" id="categoryFilterRow">
-              <button type="button" class="cat-chip-3d active" data-cat="ALL" onclick="filterServicesByCat('ALL')">Të gjitha</button>
-              <button type="button" class="cat-chip-3d" data-cat="Kombinim" onclick="filterServicesByCat('Kombinim')">Kombinim</button>
-              <button type="button" class="cat-chip-3d" data-cat="Thonj" onclick="filterServicesByCat('Thonj')">Thonj</button>
-              <button type="button" class="cat-chip-3d" data-cat="Qerpikë" onclick="filterServicesByCat('Qerpikë')">Qerpikë</button>
-              <button type="button" class="cat-chip-3d" data-cat="Vetulla" onclick="filterServicesByCat('Vetulla')">Vetulla</button>
-            </div>
-
-            <form method="POST" id="bookingForm">
-              <input type="hidden" name="post_mode" value="booking">
-              <input type="hidden" name="active_tab" value="book">
-
-              <label for="service_id">1. Zgjidh Shërbimin / Paketën</label>
-              <select name="service_id" id="service_id" required>
-                {service_options}
-              </select>
-
-              <label for="appt_date">2. Zgjidh Datën</label>
-              <input type="date" name="appt_date" id="appt_date" value="{today_str}" min="{today_str}" required>
-
-              <label>3. Zgjidh Orarin e Lirë</label>
-              <div id="slotsContainer" class="slots">Duke ngarkuar oraret...</div>
-              <input type="hidden" name="start_time" id="start_time" required>
-
-              <div class="row-2">
-                <div>
-                  <label for="client_contact">Llogaria (Email / IG)</label>
-                  <input type="text" name="client_contact" id="client_contact" value="{esc(saved_client_contact)}" {contact_readonly_attr} placeholder="p.sh. sara@email.com ose @sara.beauty" required>
-                </div>
-                <div>
-                  <label for="client_phone">Numri i Telefonit *</label>
-                  <input type="tel" name="client_phone" id="client_phone" value="{esc(saved_client_phone)}" placeholder="p.sh. +383 44 ..." required>
-                </div>
+            <div class="row-2">
+              <div>
+                <label for="auth_full_name">Emri (opsionale)</label>
+                <input type="text" name="auth_full_name" id="auth_full_name" placeholder="p.sh. Sara Berisha">
               </div>
+              <div>
+                <label for="auth_phone">Telefoni (opsionale)</label>
+                <input type="tel" name="auth_phone" id="auth_phone" placeholder="+383 44 ...">
+              </div>
+            </div>
 
-              <label for="notes">Detaje për Thonj, Qerpikë ose Vetulla</label>
-              <textarea name="notes" id="notes" rows="2" placeholder="p.sh. thonj mandorle vishnje, lash lift, laminim vetullash..."></textarea>
-
-              <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:14px;">
-                ✨ Dërgo Kërkesën për Termin
-              </button>
-            </form>
-          </div>
-        """
-
-    if is_admin_viewing:
-        header_right_buttons = f"""
-            <a href="{url_for('admin_panel')}" class="btn-3d btn-ghost-3d">🛡️ Paneli Admin</a>
-            <a href="{url_for('admin_logout')}" class="btn-3d btn-ghost-3d">Dil</a>
-        """
-    else:
-        header_right_buttons = f"""
-            <a href="{url_for('admin_login')}" class="btn-3d btn-ghost-3d">🔒 Admin</a>
-            <a href="{url_for('admin_reset_password')}" class="btn-3d btn-ghost-3d">🔑 Reset password</a>
+            <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:11px; padding:9px 12px; font-size:0.84rem;">
+              Kyçu / Regjistrohu
+            </button>
+          </form>
+        </div>
         """
 
     w_start = settings.get("work_start") or WORK_START
@@ -3255,14 +2456,14 @@ def index():
             {ig_nav_html}
           </div>
           <div class="header-actions">
-            {header_right_buttons}
+            <a href="{url_for('admin_login')}" class="btn-3d btn-ghost-3d">🔒 Admin</a>
+            <a href="{url_for('admin_reset_password')}" class="btn-3d btn-ghost-3d">🔑 Reset password</a>
           </div>
         </div>
       </header>
 
       <div class="container">
         {alert_html}
-        {admin_viewing_banner}
 
         <div class="install-prompt-box" id="pwaInstallBanner" style="display:flex;">
           <div style="font-size:0.76rem; color:var(--vishnje-dark); line-height:1.3;">
@@ -3301,9 +2502,56 @@ def index():
         </div>
 
         <div id="tab-book" class="tab-panel {'active' if active_tab == 'book' else ''}">
-          {client_auth_panels_html}
+          {client_login_card}
           {client_appts_html}
-          {booking_form_card_html}
+
+          <div class="card-3d">
+            <h2>Rezervo Terminin Tënd</h2>
+
+            <label>Filtro sipas Zonës</label>
+            <div class="cat-filter-row" id="categoryFilterRow">
+              <button type="button" class="cat-chip-3d active" data-cat="ALL" onclick="filterServicesByCat('ALL')">Të gjitha</button>
+              <button type="button" class="cat-chip-3d" data-cat="Kombinim" onclick="filterServicesByCat('Kombinim')">Kombinim</button>
+              <button type="button" class="cat-chip-3d" data-cat="Thonj" onclick="filterServicesByCat('Thonj')">Thonj</button>
+              <button type="button" class="cat-chip-3d" data-cat="Qerpikë" onclick="filterServicesByCat('Qerpikë')">Qerpikë</button>
+              <button type="button" class="cat-chip-3d" data-cat="Vetulla" onclick="filterServicesByCat('Vetulla')">Vetulla</button>
+            </div>
+
+            <form method="POST" id="bookingForm">
+              <input type="hidden" name="post_mode" value="booking">
+              <input type="hidden" name="active_tab" value="book">
+
+              <label for="service_id">1. Zgjidh Shërbimin / Paketën</label>
+              <select name="service_id" id="service_id" required>
+                {service_options}
+              </select>
+
+              <label for="appt_date">2. Zgjidh Datën</label>
+              <input type="date" name="appt_date" id="appt_date" value="{today_str}" min="{today_str}" required>
+
+              <label>3. Zgjidh Orarin e Lirë</label>
+              <div id="slotsContainer" class="slots">Duke ngarkuar oraret...</div>
+              <input type="hidden" name="start_time" id="start_time" required>
+
+              <div class="row-2">
+                <div>
+                  <label for="client_contact">Email ose Instagram</label>
+                  <input type="text" name="client_contact" id="client_contact" value="{html.escape(saved_client_contact, quote=True)}" placeholder="p.sh. sara@email.com ose @sara.beauty" required>
+                </div>
+                <div>
+                  <label for="client_phone">Numri i Telefonit</label>
+                  <input type="tel" name="client_phone" id="client_phone" value="{html.escape(saved_client_phone, quote=True)}" placeholder="p.sh. +383 44 ..." required>
+                </div>
+              </div>
+
+              <label for="notes">Detaje për Thonj, Qerpikë ose Vetulla</label>
+              <textarea name="notes" id="notes" rows="2" placeholder="p.sh. thonj mandorle vishnje, lash lift, laminim vetullash..."></textarea>
+
+              <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; margin-top:14px;">
+                ✨ Dërgo Kërkesën për Termin
+              </button>
+            </form>
+          </div>
         </div>
 
         <div id="tab-install" class="tab-panel {'active' if active_tab == 'install' else ''}">
@@ -3317,8 +2565,7 @@ def index():
                   <div class="svc-desc">
                     1. Hap linkun e <b>Grande Studio</b> në <b>Safari</b>.<br>
                     2. Shtyp ikonën <b>Share</b> (katrori me shigjetë).<br>
-                    3. Zgjidh <b>Add to Home Screen</b> dhe shtyp <b>Add</b>.<br>
-                    4. Hape nga Home Screen dhe shtyp <b>🔔 Lock Screen</b> për njoftime kur aplikacioni është i mbyllur.
+                    3. Zgjidh <b>Add to Home Screen</b> dhe shtyp <b>Add</b>.
                   </div>
                 </div>
               </div>
@@ -3341,9 +2588,9 @@ def index():
           <div class="card-3d">
             <h2>Orari &amp; Standardet — Grande Studio</h2>
             <p style="margin:0; color:var(--muted); font-size:0.84rem; line-height:1.55;">
-              • <b>Orari i rezervimeve:</b> {esc(w_start)} – {esc(w_end)} (llogaritja e kohëzgjatjes bëhet automatikisht).<br>
-              • <b>Higjiena &amp; Sterilizimi:</b> {esc(hygiene_note)}<br>
-              • <b>Instagram:</b> <a href="{esc(IG_WEB_URL)}" data-ig-app="{esc(IG_APP_URL)}" data-ig-web="{esc(IG_WEB_URL)}" onclick="openInstagramProfile(event)" style="color:var(--vishnje);font-weight:700;">@{esc(IG_USERNAME)}</a>
+              • <b>Orari i rezervimeve:</b> {html.escape(w_start)} – {html.escape(w_end)} (llogaritja e kohëzgjatjes bëhet automatikisht).<br>
+              • <b>Higjiena &amp; Sterilizimi:</b> {html.escape(hygiene_note)}<br>
+              • <b>Instagram:</b> <a href="{IG_WEB_URL}" data-ig-app="{IG_APP_URL}" data-ig-web="{IG_WEB_URL}" onclick="openInstagramProfile(event)" style="color:var(--vishnje);font-weight:700;">@{IG_USERNAME}</a>
             </p>
           </div>
         </div>
@@ -3421,6 +2668,7 @@ def index():
           }});
         }}
 
+        // Rikthen tabin e zgjedhur nga klienti pa ndërhyrë në klikime
         try {{
           const urlParams = new URLSearchParams(window.location.search);
           const forcedTab = urlParams.get('tab');
@@ -3437,107 +2685,95 @@ def index():
         const slotsEl = document.getElementById('slotsContainer');
         const startInput = document.getElementById('start_time');
         const clientContactInput = document.getElementById('client_contact');
-        const bookingFormEl = document.getElementById('bookingForm');
 
-        if (clientContactInput && clientContactInput.value) {{
-          try {{ localStorage.setItem('gs_client_contact', clientContactInput.value.trim().toLowerCase()); }} catch (e) {{}}
+        if (clientContactInput) {{
+          if (clientContactInput.value) {{
+            try {{ localStorage.setItem('gs_client_contact', clientContactInput.value.trim().toLowerCase()); }} catch (e) {{}}
+          }}
+          clientContactInput.addEventListener('blur', () => {{
+            const val = clientContactInput.value.trim().toLowerCase();
+            if (val) {{
+              try {{ localStorage.setItem('gs_client_contact', val); }} catch (e) {{}}
+              autoEnableNotificationsAndPush(val);
+            }}
+          }});
         }}
 
-        if (svcEl && dateEl && slotsEl && startInput) {{
-          const allOptions = Array.from(svcEl.options).map(opt => ({{
-            value: opt.value,
-            cat: opt.getAttribute('data-cat'),
-            text: opt.text
-          }}));
+        const allOptions = Array.from(svcEl.options).map(opt => ({{
+          value: opt.value,
+          cat: opt.getAttribute('data-cat'),
+          text: opt.text
+        }}));
 
-          window.filterServicesByCat = function(cat) {{
-            document.querySelectorAll('#categoryFilterRow .cat-chip-3d').forEach(b => {{
-              b.classList.toggle('active', b.getAttribute('data-cat') === cat);
-            }});
-            const filtered = cat === 'ALL' ? allOptions : allOptions.filter(o => o.cat === cat);
-            svcEl.innerHTML = '';
-            filtered.forEach(o => {{
-              const opt = document.createElement('option');
-              opt.value = o.value;
-              opt.setAttribute('data-cat', o.cat);
-              opt.textContent = o.text;
-              svcEl.appendChild(opt);
-            }});
-            loadSlots();
-          }};
-
-          async function loadSlots() {{
-            startInput.value = '';
-            if (!svcEl.value) {{
-              slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Nuk ka shërbim të zgjedhur.</span>';
-              return;
-            }}
-            slotsEl.innerHTML = '<span style="color:#6e4e57;font-size:0.82rem;">Po kontrollohen oraret e lira...</span>';
-            try {{
-              const res = await fetch(`/api/slots?date=${{encodeURIComponent(dateEl.value)}}&service_id=${{encodeURIComponent(svcEl.value)}}`);
-              const data = await res.json();
-              slotsEl.innerHTML = '';
-
-              if (!data.slots || data.slots.length === 0) {{
-                slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Nuk ka orare të lira për këtë datë dhe kohëzgjatje.</span>';
-                return;
-              }}
-
-              data.slots.forEach(slot => {{
-                const btn = document.createElement('button');
-                btn.type = 'button';
-                btn.className = 'slot-3d';
-                btn.textContent = slot;
-                btn.onclick = () => {{
-                  document.querySelectorAll('.slot-3d').forEach(b => b.classList.remove('active'));
-                  btn.classList.add('active');
-                  startInput.value = slot;
-                }};
-                slotsEl.appendChild(btn);
-              }});
-            }} catch (e) {{
-              slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Gabim gjatë ngarkimit të orareve.</span>';
-            }}
-          }}
-
-          svcEl.addEventListener('change', loadSlots);
-          dateEl.addEventListener('change', loadSlots);
-          if (bookingFormEl) {{
-            bookingFormEl.addEventListener('submit', (e) => {{
-              if (!startInput.value) {{
-                e.preventDefault();
-                alert('Ju lutem zgjidhni një orar të lirë!');
-                return;
-              }}
-              if (clientContactInput && clientContactInput.value) {{
-                try {{ localStorage.setItem('gs_client_contact', clientContactInput.value.trim().toLowerCase()); }} catch (err) {{}}
-              }}
-            }});
-          }}
-
+        function filterServicesByCat(cat) {{
+          document.querySelectorAll('#categoryFilterRow .cat-chip-3d').forEach(b => {{
+            b.classList.toggle('active', b.getAttribute('data-cat') === cat);
+          }});
+          const filtered = cat === 'ALL' ? allOptions : allOptions.filter(o => o.cat === cat);
+          svcEl.innerHTML = '';
+          filtered.forEach(o => {{
+            const opt = document.createElement('option');
+            opt.value = o.value;
+            opt.setAttribute('data-cat', o.cat);
+            opt.textContent = o.text;
+            svcEl.appendChild(opt);
+          }});
           loadSlots();
         }}
 
+        async function loadSlots() {{
+          startInput.value = '';
+          if (!svcEl.value) {{
+            slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Nuk ka shërbim të zgjedhur.</span>';
+            return;
+          }}
+          slotsEl.innerHTML = '<span style="color:#6e4e57;font-size:0.82rem;">Po kontrollohen oraret e lira...</span>';
+          const res = await fetch(`/api/slots?date=${{encodeURIComponent(dateEl.value)}}&service_id=${{encodeURIComponent(svcEl.value)}}`);
+          const data = await res.json();
+          slotsEl.innerHTML = '';
+
+          if (!data.slots || data.slots.length === 0) {{
+            slotsEl.innerHTML = '<span style="color:#b41e2d;font-size:0.82rem;">Nuk ka orare të lira për këtë datë dhe kohëzgjatje.</span>';
+            return;
+          }}
+
+          data.slots.forEach(slot => {{
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'slot-3d';
+            btn.textContent = slot;
+            btn.onclick = () => {{
+              document.querySelectorAll('.slot-3d').forEach(b => b.classList.remove('active'));
+              btn.classList.add('active');
+              startInput.value = slot;
+            }};
+            slotsEl.appendChild(btn);
+          }});
+        }}
+
+        svcEl.addEventListener('change', loadSlots);
+        dateEl.addEventListener('change', loadSlots);
+        document.getElementById('bookingForm').addEventListener('submit', (e) => {{
+          if (!startInput.value) {{
+            e.preventDefault();
+            alert('Ju lutem zgjidhni një orar të lirë!');
+            return;
+          }}
+          if (clientContactInput && clientContactInput.value) {{
+            const cVal = clientContactInput.value.trim().toLowerCase();
+            try {{ localStorage.setItem('gs_client_contact', cVal); }} catch (err) {{}}
+            autoEnableNotificationsAndPush(cVal);
+          }}
+        }});
+
+        // Kontrollon çdo 5 sekonda nëse admini e ka konfirmuar ose anuluar terminin e klientit
         setInterval(async () => {{
           try {{
-            const c = getActiveClientContact();
+            const c = (PUSH_CLIENT_CONTACT || localStorage.getItem('gs_client_contact') || '').trim();
             if (!c) return;
             const res = await fetch(`/api/client/status-updates?contact=${{encodeURIComponent(c)}}`);
             if (!res.ok) return;
             const data = await res.json();
-
-            if (data.blocked) {{
-              try {{ localStorage.removeItem('gs_client_contact'); }} catch (e) {{}}
-              window.location.href = '/client/logout';
-              return;
-            }}
-
-            if (data.reset_pending && !document.getElementById('clientNewPasswordModal')) {{
-              const qs = data.reset_token ? `?reset_token=${{encodeURIComponent(data.reset_token)}}` : '';
-              window.location.href = '/' + qs;
-              return;
-            }}
-
             if (data.updates && data.updates.length > 0) {{
               const u = data.updates[0];
               playAutoAlertSound();
@@ -3556,7 +2792,9 @@ def index():
               banner.style.display = 'block';
             }}
           }} catch (e) {{}}
-        }}, 4000);
+        }}, 5000);
+
+        loadSlots();
       </script>
     """
     return render_iphone_shell(
@@ -3564,16 +2802,13 @@ def index():
         inner,
         role_tag=role_tag,
         client_contact_tag=saved_client_contact,
-        auto_redirect_admin_on_launch=is_admin_viewing,
-        admin_persist_token=session.get("admin_persist_token", ""),
-        client_persist_token=session.get("client_persist_token", ""),
     )
 
 
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     init_db()
-    if is_admin_authenticated():
+    if session.get("admin_logged_in"):
         return redirect(url_for("admin_panel"))
 
     acc = get_admin_account()
@@ -3595,26 +2830,22 @@ def admin_login():
                 err = "Fjalëkalimet nuk përputhen."
             else:
                 conn = get_db()
-                try:
-                    cur = conn.cursor()
-                    cur.execute(
-                        """
-                        INSERT INTO admin_account (id, email, password_hash, updated_at)
-                        VALUES (1, ?, ?, ?)
-                        """,
-                        (email, generate_password_hash(pwd), datetime.now().isoformat()),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
-                issue_persistent_login("admin")
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO admin_account (id, email, password_hash, updated_at)
+                    VALUES (1, ?, ?, ?)
+                    """,
+                    (email, generate_password_hash(pwd), datetime.now().isoformat()),
+                )
+                conn.commit()
+                conn.close()
+                session.clear()
+                session.permanent = True
+                session["admin_logged_in"] = True
                 return redirect(url_for("admin_panel"))
 
-        alert_html = (
-            f'<div class="alert alert-err"><span>{esc(err)}</span><button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button></div>'
-            if err
-            else ""
-        )
+        alert_html = f'<div class="alert alert-err"><span>{html.escape(err)}</span><button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button></div>' if err else ""
         inner = f"""
           <header>
             <div class="header-inner">
@@ -3626,7 +2857,7 @@ def admin_login():
                 {ig_nav_html}
               </div>
               <div class="header-actions">
-                <a href="{url_for('index', stay_client='1')}" class="btn-3d btn-ghost-3d">← Klienti</a>
+                <a href="{url_for('index')}" class="btn-3d btn-ghost-3d">← Klienti</a>
               </div>
             </div>
           </header>
@@ -3663,18 +2894,16 @@ def admin_login():
         else:
             email_in = request.form.get("email", "").strip().lower()
             pwd_in = request.form.get("password", "")
-            if email_in == (acc["email"] or "").strip().lower() and check_password_hash(acc["password_hash"], pwd_in):
+            if email_in == acc["email"].strip().lower() and check_password_hash(acc["password_hash"], pwd_in):
                 clear_failed_login(client_ip)
-                issue_persistent_login("admin")
+                session.clear()
+                session.permanent = True
+                session["admin_logged_in"] = True
                 return redirect(url_for("admin_panel"))
             record_failed_login(client_ip)
             err = "Emaili ose fjalëkalimi është i pasaktë."
 
-    err_html = (
-        f'<div class="alert alert-err"><span>{esc(err)}</span><button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button></div>'
-        if err
-        else ""
-    )
+    err_html = f'<div class="alert alert-err"><span>{html.escape(err)}</span><button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button></div>' if err else ""
 
     inner = f"""
       <header>
@@ -3687,7 +2916,7 @@ def admin_login():
             {ig_nav_html}
           </div>
           <div class="header-actions">
-            <a href="{url_for('index', stay_client='1')}" class="btn-3d btn-ghost-3d">← Klienti</a>
+            <a href="{url_for('index')}" class="btn-3d btn-ghost-3d">← Klienti</a>
             <a href="{url_for('admin_reset_password')}" class="btn-3d btn-ghost-3d">🔑 Reset password</a>
           </div>
         </div>
@@ -3726,22 +2955,20 @@ def admin_reset_password():
 
     if request.method == "POST":
         entered_email = request.form.get("reset_email", "").strip().lower()
-        if entered_email != (acc["email"] or "").strip().lower():
+        if entered_email != acc["email"].strip().lower():
             msg = "Ky email nuk përputhet me emailin e regjistruar të pronarit."
             msg_type = "err"
         else:
             new_pwd = generate_temp_password(12)
             conn = get_db()
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    "UPDATE admin_account SET password_hash = ?, updated_at = ? WHERE id = 1",
-                    (generate_password_hash(new_pwd), datetime.now().isoformat()),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-            revoke_persistent_login("admin")
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE admin_account SET password_hash = ?, updated_at = ? WHERE id = 1",
+                (generate_password_hash(new_pwd), datetime.now().isoformat()),
+            )
+            conn.commit()
+            conn.close()
+            session.pop("admin_logged_in", None)
 
             sent, info_txt = send_reset_email(acc["email"], new_pwd)
             msg = info_txt
@@ -3750,7 +2977,7 @@ def admin_reset_password():
     alert_html = ""
     if msg:
         cls = "alert-ok" if msg_type == "ok" else "alert-err"
-        alert_html = f'<div class="alert {cls}"><span>{esc(msg)}</span><button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button></div>'
+        alert_html = f'<div class="alert {cls}"><span>{html.escape(msg)}</span><button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button></div>'
 
     inner = f"""
       <header>
@@ -3763,7 +2990,7 @@ def admin_reset_password():
             {ig_nav_html}
           </div>
           <div class="header-actions">
-            <a href="{url_for('index', stay_client='1')}" class="btn-3d btn-ghost-3d">← Klienti</a>
+            <a href="{url_for('index')}" class="btn-3d btn-ghost-3d">← Klienti</a>
             <a href="{url_for('admin_login')}" class="btn-3d btn-ghost-3d">🔒 Admin</a>
           </div>
         </div>
@@ -3790,7 +3017,7 @@ def admin_reset_password():
 
 @app.route("/admin/logout")
 def admin_logout():
-    revoke_persistent_login("admin")
+    session.clear()
     return redirect(url_for("admin_login"))
 
 
@@ -3799,12 +3026,10 @@ def admin_logout():
 def admin_panel():
     init_db()
     acc = get_admin_account()
-    if acc is None:
-        revoke_persistent_login("admin")
-        return redirect(url_for("admin_login"))
-
     ig_nav_html = get_ig_nav_button_html()
     settings = get_salon_settings()
+    conn = get_db()
+    cur = conn.cursor()
     today_str = datetime.now().strftime("%Y-%m-%d")
     feedback_msg = None
     feedback_type = "ok"
@@ -3812,178 +3037,135 @@ def admin_panel():
     external_reset_label = ""
     show_clients_modal = False
 
-    conn = get_db()
-    try:
-        cur = conn.cursor()
+    if request.method == "POST":
+        action = request.form.get("action")
 
-        if request.method == "POST":
-            action = request.form.get("action")
-
-            if action == "delete_client":
-                client_id = request.form.get("client_id", type=int)
-                show_clients_modal = True
-                if client_id:
-                    cur.execute("SELECT contact_value FROM clients WHERE id = ?", (client_id,))
-                    cli_del = cur.fetchone()
-                    cur.execute("DELETE FROM clients WHERE id = ?", (client_id,))
-                    if cli_del:
-                        cur.execute("DELETE FROM push_subscriptions WHERE LOWER(client_contact) = ?", (cli_del["contact_value"].lower(),))
-                        if (session.get("client_contact") or "").lower() == cli_del["contact_value"].lower():
-                            clear_client_session_keys()
-                    conn.commit()
-                    feedback_msg = "Klienti u fshi nga databaza."
-                    feedback_type = "ok"
-
-            elif action == "toggle_block_client":
-                client_id = request.form.get("client_id", type=int)
-                show_clients_modal = True
-                if client_id:
-                    cur.execute("SELECT * FROM clients WHERE id = ?", (client_id,))
-                    cli_blk = cur.fetchone()
-                    if cli_blk:
-                        new_blocked = 0 if cli_blk["is_blocked"] == 1 else 1
-                        cur.execute(
-                            "UPDATE clients SET is_blocked = ?, updated_at = ? WHERE id = ?",
-                            (new_blocked, datetime.now().isoformat(), client_id),
-                        )
-                        if new_blocked == 1 and (session.get("client_contact") or "").lower() == cli_blk["contact_value"].lower():
-                            clear_client_session_keys()
-                        conn.commit()
-                        if new_blocked == 1:
-                            feedback_msg = f"Klienti {cli_blk['contact_value']} u bllokua dhe nuk ka më qasje në aplikacion."
-                        else:
-                            feedback_msg = f"Klienti {cli_blk['contact_value']} u çbllokua dhe mund të hyjë sërish në aplikacion."
-                        feedback_type = "ok"
-
-            elif action == "refresh_client_password":
-                client_id = request.form.get("client_id", type=int)
-                show_clients_modal = True
-                if client_id:
-                    cur.execute("SELECT * FROM clients WHERE id = ?", (client_id,))
-                    cli = cur.fetchone()
-                    if cli:
-                        token = secrets.token_urlsafe(16)
-                        reset_url = f"{request.url_root.rstrip('/')}/?reset_token={token}"
-                        channel_label, ext_url = send_client_password_reset_notification(cli, reset_url)
-                        cur.execute(
-                            """
-                            UPDATE clients
-                            SET is_blocked = 0, reset_pending = 1, reset_token = ?, reset_sent_via = ?, updated_at = ?
-                            WHERE id = ?
-                            """,
-                            (token, channel_label, datetime.now().isoformat(), client_id),
-                        )
-                        conn.commit()
-                        send_push_to_client(
-                            cli["contact_value"],
-                            title="🔐 Reseto Passwordin — Grande Studio",
-                            body=f"Admini dërgoi kërkesën për password të ri te {channel_label}. Klikoni për ta vendosur.",
-                            url=f"/?reset_token={token}",
-                        )
-                        external_reset_link = ext_url
-                        external_reset_label = channel_label
-                        feedback_msg = f"Njoftimi për resetimin e passwordit u dërgua te {channel_label}."
-                        feedback_type = "ok"
-
-            elif action == "mark_seen":
-                appt_id = request.form.get("appt_id", type=int)
-                if appt_id:
-                    cur.execute("UPDATE appointments SET is_new = 0 WHERE id = ?", (appt_id,))
-                    conn.commit()
-                    feedback_msg = "Njoftimi u hoq."
-                    feedback_type = "ok"
-
-            elif action == "mark_all_seen":
-                cur.execute("UPDATE appointments SET is_new = 0 WHERE is_new = 1")
-                conn.commit()
-                feedback_msg = "Të gjitha njoftimet u hoqën."
-                feedback_type = "ok"
-
-            elif action == "change_password":
-                curr_pwd = request.form.get("current_password", "")
-                new_pwd = request.form.get("new_password", "")
-                conf_pwd = request.form.get("confirm_password", "")
-
-                if not check_password_hash(acc["password_hash"], curr_pwd):
-                    feedback_msg = "Fjalëkalimi aktual është i pasaktë."
-                    feedback_type = "err"
-                elif len(new_pwd) < 6:
-                    feedback_msg = "Fjalëkalimi i ri duhet të ketë të paktën 6 karaktere."
-                    feedback_type = "err"
-                elif new_pwd != conf_pwd:
-                    feedback_msg = "Konfirmimi i fjalëkalimit të ri nuk përputhet."
-                    feedback_type = "err"
-                else:
-                    cur.execute(
-                        "UPDATE admin_account SET password_hash = ?, updated_at = ? WHERE id = 1",
-                        (generate_password_hash(new_pwd), datetime.now().isoformat()),
+        if action == "refresh_client_password":
+            client_id = request.form.get("client_id", type=int)
+            show_clients_modal = True
+            if client_id:
+                cur.execute("SELECT * FROM clients WHERE id = ?", (client_id,))
+                cli = cur.fetchone()
+                if cli:
+                    token = secrets.token_urlsafe(16)
+                    channel_label, ext_url = send_client_password_reset_notification(
+                        cli,
+                        f"{request.url_root.rstrip('/')}/?reset_token={token}",
                     )
-                    conn.commit()
-                    cur.execute("SELECT * FROM admin_account WHERE id = 1")
-                    acc = cur.fetchone()
-                    feedback_msg = "Fjalëkalimi u ndryshua dhe u ruajt automatikisht."
-                    feedback_type = "ok"
-
-            elif action == "update_service":
-                svc_id = request.form.get("svc_id", type=int)
-                s_cat = (request.form.get("s_cat") or "Thonj").strip()
-                s_name = (request.form.get("s_name") or "").strip()
-                try:
-                    s_dur = int(request.form.get("s_dur") or 60)
-                except Exception:
-                    s_dur = 60
-                try:
-                    s_price = float(request.form.get("s_price") or 0.0)
-                except Exception:
-                    s_price = 0.0
-                s_desc = (request.form.get("s_desc") or "").strip()
-                if svc_id and s_name:
                     cur.execute(
                         """
-                        UPDATE services
-                        SET category = ?, name = ?, duration_min = ?, price = ?, description = ?
+                        UPDATE clients
+                        SET reset_pending = 1, reset_token = ?, reset_sent_via = ?, updated_at = ?
                         WHERE id = ?
                         """,
-                        (s_cat, s_name, max(15, s_dur), max(0.0, s_price), s_desc, svc_id),
+                        (token, channel_label, datetime.now().isoformat(), client_id),
                     )
                     conn.commit()
-                    feedback_msg = f"Shërbimi '{s_name}' u ruajt automatikisht."
+                    external_reset_link = ext_url
+                    external_reset_label = channel_label
+                    feedback_msg = f"Njoftimi për rivendosjen e passwordit u dërgua te {channel_label}."
                     feedback_type = "ok"
 
-            elif action == "add_service":
-                s_cat = (request.form.get("s_cat") or "Thonj").strip()
-                s_name = (request.form.get("s_name") or "").strip()
+        elif action == "mark_seen":
+            appt_id = request.form.get("appt_id", type=int)
+            if appt_id:
+                cur.execute("UPDATE appointments SET is_new = 0 WHERE id = ?", (appt_id,))
+                conn.commit()
+                feedback_msg = "Njoftimi u hoq."
+                feedback_type = "ok"
+
+        elif action == "mark_all_seen":
+            cur.execute("UPDATE appointments SET is_new = 0 WHERE is_new = 1")
+            conn.commit()
+            feedback_msg = "Të gjitha njoftimet u hoqën."
+            feedback_type = "ok"
+
+        elif action == "change_password":
+            curr_pwd = request.form.get("current_password", "")
+            new_pwd = request.form.get("new_password", "")
+            conf_pwd = request.form.get("confirm_password", "")
+
+            if not check_password_hash(acc["password_hash"], curr_pwd):
+                feedback_msg = "Fjalëkalimi aktual është i pasaktë."
+                feedback_type = "err"
+            elif len(new_pwd) < 6:
+                feedback_msg = "Fjalëkalimi i ri duhet të ketë të paktën 6 karaktere."
+                feedback_type = "err"
+            elif new_pwd != conf_pwd:
+                feedback_msg = "Konfirmimi i fjalëkalimit të ri nuk përputhet."
+                feedback_type = "err"
+            else:
+                cur.execute(
+                    "UPDATE admin_account SET password_hash = ?, updated_at = ? WHERE id = 1",
+                    (generate_password_hash(new_pwd), datetime.now().isoformat()),
+                )
+                conn.commit()
+                acc = get_admin_account()
+                feedback_msg = "Fjalëkalimi u ndryshua dhe u ruajt automatikisht."
+                feedback_type = "ok"
+
+        elif action == "update_service":
+            svc_id = request.form.get("svc_id", type=int)
+            s_cat = request.form.get("s_cat", "Thonj").strip()
+            s_name = request.form.get("s_name", "").strip()
+            raw_dur = request.form.get("s_dur", "").strip()
+            raw_price = request.form.get("s_price", "").strip()
+            s_desc = request.form.get("s_desc", "").strip()
+            if svc_id and s_name:
+                cur.execute("SELECT duration_min, price FROM services WHERE id = ?", (svc_id,))
+                prev_svc = cur.fetchone()
                 try:
-                    s_dur = int(request.form.get("s_dur") or 60)
+                    s_dur = int(raw_dur) if raw_dur else (prev_svc["duration_min"] if prev_svc else 60)
                 except Exception:
-                    s_dur = 60
+                    s_dur = prev_svc["duration_min"] if prev_svc else 60
                 try:
-                    s_price = float(request.form.get("s_price") or 0.0)
+                    s_price = float(raw_price) if raw_price else (prev_svc["price"] if prev_svc else 0.0)
                 except Exception:
-                    s_price = 0.0
-                s_desc = (request.form.get("s_desc") or "").strip()
-                if s_name:
-                    cur.execute(
-                        "INSERT INTO services (category, name, duration_min, price, description) VALUES (?, ?, ?, ?, ?)",
-                        (s_cat, s_name, max(15, s_dur), max(0.0, s_price), s_desc),
-                    )
-                    conn.commit()
-                    feedback_msg = f"Shërbimi i ri '{s_name}' u shtua dhe u ruajt."
-                    feedback_type = "ok"
+                    s_price = prev_svc["price"] if prev_svc else 0.0
+                cur.execute(
+                    """
+                    UPDATE services
+                    SET category = ?, name = ?, duration_min = ?, price = ?, description = ?
+                    WHERE id = ?
+                    """,
+                    (s_cat, s_name, max(15, s_dur), max(0.0, s_price), s_desc, svc_id),
+                )
+                conn.commit()
+                feedback_msg = f"Shërbimi '{s_name}' u ruajt automatikisht."
+                feedback_type = "ok"
 
-            elif action == "delete_service":
-                svc_id = request.form.get("svc_id", type=int)
-                if svc_id:
-                    cur.execute("DELETE FROM services WHERE id = ?", (svc_id,))
-                    conn.commit()
-                    feedback_msg = "Shërbimi u hoq."
-                    feedback_type = "ok"
+        elif action == "add_service":
+            s_cat = request.form.get("s_cat", "Thonj").strip()
+            s_name = request.form.get("s_name", "").strip()
+            s_dur = request.form.get("s_dur", type=int) or 60
+            s_price = request.form.get("s_price", type=float) or 0.0
+            s_desc = request.form.get("s_desc", "").strip()
+            if s_name:
+                cur.execute(
+                    "INSERT INTO services (category, name, duration_min, price, description) VALUES (?, ?, ?, ?, ?)",
+                    (s_cat, s_name, s_dur, s_price, s_desc),
+                )
+                conn.commit()
+                feedback_msg = f"Shërbimi i ri '{s_name}' u shtua dhe u ruajt."
+                feedback_type = "ok"
 
-            elif action == "block_slot":
-                b_date = (request.form.get("block_date") or today_str).strip()
-                b_start = (request.form.get("block_start") or "09:00").strip()
-                b_end = (request.form.get("block_end") or "10:00").strip()
-                b_reason = (request.form.get("block_reason") or "Bllokuar nga Grande Studio").strip() or "Bllokuar"
+        elif action == "delete_service":
+            svc_id = request.form.get("svc_id", type=int)
+            if svc_id:
+                cur.execute("DELETE FROM services WHERE id = ?", (svc_id,))
+                conn.commit()
+                feedback_msg = "Shërbimi u hoq."
+                feedback_type = "ok"
+
+        elif action == "block_slot":
+            b_date = request.form.get("block_date", today_str)
+            b_start = request.form.get("block_start", "09:00")
+            b_end = request.form.get("block_end", "10:00")
+            b_reason = request.form.get("block_reason", "Bllokuar nga Grande Studio").strip() or "Bllokuar"
+            if time_to_min(b_start) >= time_to_min(b_end):
+                feedback_msg = "Ora e fillimit duhet të jetë më e vogël se ora e mbarimit."
+                feedback_type = "err"
+            else:
                 cur.execute("SELECT id FROM services LIMIT 1")
                 first_svc = cur.fetchone()
                 svc_id = first_svc["id"] if first_svc else None
@@ -3999,160 +3181,119 @@ def admin_panel():
                 feedback_msg = "Orari u bllokua dhe u ruajt automatikisht."
                 feedback_type = "ok"
 
-            elif action == "set_status":
-                appt_id = request.form.get("appt_id", type=int)
-                new_status = request.form.get("status", "Konfirmuar")
-                if appt_id and new_status in ("Konfirmuar", "Anuluar", "Bllokuar"):
-                    cur.execute(
-                        """
-                        SELECT a.*, s.name AS service_name
-                        FROM appointments a
-                        LEFT JOIN services s ON a.service_id = s.id
-                        WHERE a.id = ?
-                        """,
-                        (appt_id,),
-                    )
-                    appt_row = cur.fetchone()
-                    cur.execute(
-                        "UPDATE appointments SET status = ?, is_new = 0, client_notified = 0 WHERE id = ?",
-                        (new_status, appt_id),
-                    )
-                    conn.commit()
+        elif action == "set_status":
+            appt_id = request.form.get("appt_id", type=int)
+            new_status = request.form.get("status", "Konfirmuar")
+            if appt_id and new_status in ("Konfirmuar", "Anuluar", "Bllokuar"):
+                cur.execute(
+                    """
+                    SELECT a.*, s.name AS service_name
+                    FROM appointments a
+                    LEFT JOIN services s ON a.service_id = s.id
+                    WHERE a.id = ?
+                    """,
+                    (appt_id,),
+                )
+                appt_row = cur.fetchone()
+                cur.execute(
+                    "UPDATE appointments SET status = ?, is_new = 0, client_notified = 0 WHERE id = ?",
+                    (new_status, appt_id),
+                )
+                conn.commit()
 
-                    if appt_row and new_status in ("Konfirmuar", "Anuluar"):
-                        svc_title = appt_row["service_name"] or "Trajtim"
-                        if new_status == "Konfirmuar":
-                            send_push_to_client(
-                                appt_row["client_contact"] or "",
-                                title="✅ Termini u Konfirmua — Grande Studio",
-                                body=f"Termini juaj për {svc_title} më {appt_row['appt_date']} në ora {appt_row['start_time']} u konfirmua!",
-                                url="/",
-                                appt_id=appt_id,
-                            )
-                        else:
-                            send_push_to_client(
-                                appt_row["client_contact"] or "",
-                                title="❌ Termini u Anulua — Grande Studio",
-                                body=f"Termini juaj për {svc_title} më {appt_row['appt_date']} në ora {appt_row['start_time']} u anulua.",
-                                url="/",
-                                appt_id=appt_id,
-                            )
+                if appt_row and new_status in ("Konfirmuar", "Anuluar"):
+                    svc_title = appt_row["service_name"] or "Trajtim"
+                    if new_status == "Konfirmuar":
+                        send_push_to_client(
+                            appt_row["client_contact"] or "",
+                            title="✅ Termini u Konfirmua — Grande Studio",
+                            body=f"Termini juaj për {svc_title} më {appt_row['appt_date']} në ora {appt_row['start_time']} u konfirmua!",
+                            url="/",
+                            appt_id=appt_id,
+                        )
+                    else:
+                        send_push_to_client(
+                            appt_row["client_contact"] or "",
+                            title="❌ Termini u Anulua — Grande Studio",
+                            body=f"Termini juaj për {svc_title} më {appt_row['appt_date']} në ora {appt_row['start_time']} u anulua.",
+                            url="/",
+                            appt_id=appt_id,
+                        )
 
-                    feedback_msg = f"Termini #{appt_id} u vendos '{new_status}' dhe u dërgua njoftimi te klienti."
-                    feedback_type = "ok"
+                feedback_msg = f"Termini u {new_status.lower()} dhe klienti u njoftua!"
+                feedback_type = "ok"
 
-            elif action == "delete_appt":
-                appt_id = request.form.get("appt_id", type=int)
-                if appt_id:
-                    cur.execute("DELETE FROM appointments WHERE id = ?", (appt_id,))
-                    conn.commit()
-                    feedback_msg = f"Termini #{appt_id} u fshi."
-                    feedback_type = "ok"
+        elif action == "delete_appt":
+            appt_id = request.form.get("appt_id", type=int)
+            if appt_id:
+                cur.execute("DELETE FROM appointments WHERE id = ?", (appt_id,))
+                conn.commit()
+                feedback_msg = "Termini u fshi."
+                feedback_type = "ok"
 
-        cur.execute("SELECT * FROM clients ORDER BY id DESC")
-        registered_clients = cur.fetchall()
+    cur.execute("SELECT * FROM clients ORDER BY id DESC")
+    registered_clients = cur.fetchall()
 
-        cur.execute(
-            """
-            SELECT a.*, s.name AS service_name, s.category, s.price, s.duration_min
-            FROM appointments a
-            LEFT JOIN services s ON a.service_id = s.id
-            WHERE a.is_new = 1 AND a.status IN ('Në Pritje', 'Konfirmuar')
-            ORDER BY a.id DESC
-            """
-        )
-        new_appts = cur.fetchall()
+    cur.execute(
+        """
+        SELECT a.*, s.name AS service_name, s.category, s.price
+        FROM appointments a
+        LEFT JOIN services s ON a.service_id = s.id
+        WHERE a.is_new = 1 AND a.status IN ('Në Pritje', 'Konfirmuar')
+        ORDER BY a.id DESC
+        """
+    )
+    new_appts = cur.fetchall()
 
-        cur.execute(
-            """
-            SELECT a.*, s.name AS service_name, s.category, s.price, s.duration_min
-            FROM appointments a
-            LEFT JOIN services s ON a.service_id = s.id
-            ORDER BY a.is_new DESC, a.appt_date ASC, a.start_time ASC
-            """
-        )
-        appts = cur.fetchall()
+    cur.execute(
+        """
+        SELECT a.*, s.name AS service_name, s.category, s.price
+        FROM appointments a
+        LEFT JOIN services s ON a.service_id = s.id
+        ORDER BY a.is_new DESC, a.appt_date ASC, a.start_time ASC
+        """
+    )
+    appts = cur.fetchall()
 
-        cur.execute("SELECT * FROM services ORDER BY id")
-        services = cur.fetchall()
+    cur.execute("SELECT * FROM services ORDER BY id")
+    services = cur.fetchall()
+    conn.close()
 
-        cur.execute("SELECT role, COUNT(*) AS cnt FROM push_subscriptions GROUP BY role")
-        push_counts = {r["role"]: r["cnt"] for r in cur.fetchall()}
-    finally:
-        conn.close()
-
-    pending_count = sum(1 for a in appts if a["status"] == "Në Pritje")
-    confirmed_count = sum(1 for a in appts if a["status"] == "Konfirmuar")
-    cancelled_blocked_count = sum(1 for a in appts if a["status"] in ("Anuluar", "Bllokuar"))
-    admin_push_subs = push_counts.get("admin", 0)
-    client_push_subs = push_counts.get("client", 0)
-    push_lib_badge = "Push OK" if HAS_WEBPUSH else "Mungon pywebpush!"
-
-    def build_clients_list_html(client_rows):
-        if not client_rows:
-            return '<p style="font-size:0.8rem; color:var(--muted);">Nuk ka ende klientë të regjistruar.</p>'
-        out = ""
-        for rc in client_rows:
-            is_blk = int(rc["is_blocked"] or 0) == 1
+    registered_clients_html = ""
+    if registered_clients:
+        for rc in registered_clients:
             badge_channel = "📧 Email" if rc["contact_type"] == "email" else "📸 Instagram"
-            blocked_badge = '<span class="badge-blocked" style="margin-left:5px;">I BLLOKUAR</span>' if is_blk else '<span class="badge b-ok" style="margin-left:5px;">AKTIV</span>'
-            pending_badge = '<span class="badge-new-live" style="font-size:0.62rem; margin-left:5px;">Reset në pritje</span>' if int(rc["reset_pending"] or 0) == 1 else ""
-            phone_txt = f" • 📞 {esc(rc['client_phone'])}" if rc["client_phone"] else ""
-            name_txt = f" — {esc(rc['full_name'])}" if rc["full_name"] and rc["full_name"] != rc["contact_value"] else ""
-            reg_date = esc((rc["created_at"] or "")[:16].replace("T", " "))
-            safe_confirm_contact = esc(rc["contact_value"]).replace("'", "\\'")
-
-            block_btn_label = "🔓 Çbllokoje" if is_blk else "🚫 Bllokoje"
-            block_btn_cls = "btn-unblk" if is_blk else "btn-blk"
-
-            out += f"""
-            <div class="client-list-item {'blocked-client' if is_blk else ''}">
-              <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
-                <b style="font-size:0.83rem; color:var(--vishnje-dark);">#{rc['id']} • {esc(rc['contact_value'])}{name_txt}</b>
+            pending_badge = '<span class="badge-new-live" style="font-size:0.62rem; margin-left:5px;">Në pritje të passwordit të ri</span>' if rc["reset_pending"] == 1 else ""
+            phone_txt = f" • Tel: {html.escape(rc['client_phone'])}" if rc["client_phone"] else ""
+            name_txt = f" ({html.escape(rc['full_name'])})" if rc["full_name"] and rc["full_name"] != rc["contact_value"] else ""
+            registered_clients_html += f"""
+            <div class="client-list-item" onclick="selectRegisteredClient({rc['id']}, this)">
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <b style="font-size:0.84rem; color:var(--vishnje-dark);">{html.escape(rc['contact_value'])}{name_txt}</b>
                 <span class="svc-tag">{badge_channel}</span>
               </div>
-              <div style="font-size:0.71rem; color:var(--muted); margin-top:4px; line-height:1.4;">
-                🕒 Regjistruar: <b>{reg_date}</b>{phone_txt}<br>
-                {blocked_badge} {pending_badge}
+              <div style="font-size:0.72rem; color:var(--muted); margin-top:3px;">
+                Regjistruar: {html.escape(rc['created_at'][:10])}{phone_txt} {pending_badge}
               </div>
-              <div class="client-action-grid">
-                <form method="POST">
-                  <input type="hidden" name="action" value="delete_client">
-                  <input type="hidden" name="client_id" value="{rc['id']}">
-                  <button type="submit" class="btn-sm-3d btn-del" style="width:100%;" onclick="return confirm('A jeni të sigurt që doni ta fshini klientin {safe_confirm_contact}?');">
-                    🗑️ Fshije
-                  </button>
-                </form>
-
-                <form method="POST">
-                  <input type="hidden" name="action" value="toggle_block_client">
-                  <input type="hidden" name="client_id" value="{rc['id']}">
-                  <button type="submit" class="btn-sm-3d {block_btn_cls}" style="width:100%;">
-                    {block_btn_label}
-                  </button>
-                </form>
-
-                <form method="POST">
-                  <input type="hidden" name="action" value="refresh_client_password">
-                  <input type="hidden" name="client_id" value="{rc['id']}">
-                  <button type="submit" class="btn-sm-3d btn-rst" style="width:100%;">
-                    🔑 Reseto Passwordin
-                  </button>
-                </form>
-              </div>
+              <form method="POST" class="refresh-pwd-form" style="display:none; margin-top:8px;" onclick="event.stopPropagation();">
+                <input type="hidden" name="action" value="refresh_client_password">
+                <input type="hidden" name="client_id" value="{rc['id']}">
+                <button type="submit" class="btn-3d btn-vishnje-3d" style="width:100%; padding:7px 10px; font-size:0.78rem;">
+                  🔄 Refresko Password
+                </button>
+              </form>
             </div>
             """
-        return out
-
-    registered_clients_html = build_clients_list_html(registered_clients)
+    else:
+        registered_clients_html = '<p style="font-size:0.8rem; color:var(--muted);">Nuk ka ende klientë të regjistruar.</p>'
 
     ext_link_banner = ""
     if external_reset_link:
         ext_link_banner = f"""
         <div style="background:#fff0f4; border:1px solid #fda4af; border-radius:10px; padding:8px 10px; margin-bottom:10px; font-size:0.76rem;">
-          <b>Njoftimi u dërgua te: {esc(external_reset_label)}</b><br>
-          <a href="{esc(external_reset_link)}" target="_blank" rel="noopener noreferrer" style="color:#be123c; font-weight:800; text-decoration:underline;">
-            ↗ Hap {esc(external_reset_label)} për të dërguar / parë njoftimin
+          <b>Kanali: {html.escape(external_reset_label)}</b><br>
+          <a href="{html.escape(external_reset_link, quote=True)}" target="_blank" rel="noopener noreferrer" style="color:#be123c; font-weight:800; text-decoration:underline;">
+            ↗ Hap direkt {html.escape(external_reset_label)} për t'ia dërguar klientit
           </a>
         </div>
         """
@@ -4161,22 +3302,19 @@ def admin_panel():
     if new_appts:
         cards = ""
         for na in new_appts:
-            notes_line = f"<div style='font-size:0.76rem; color:#881337; margin-top:4px;'>📝 <i>{esc(na['notes'])}</i></div>" if na["notes"] else ""
-            contact_line = f"<div style='font-size:0.75rem; color:#4c0519; margin-top:2px;'>✉️ <b>{esc(na['client_contact'])}</b></div>" if na["client_contact"] else ""
-            dur_txt = f" • {int(na['duration_min'] or 0)} min" if na["duration_min"] else ""
+            notes_line = f"<div style='font-size:0.76rem; color:#881337; margin-top:4px;'>📝 <i>{html.escape(na['notes'])}</i></div>" if na["notes"] else ""
             cards += f"""
             <div class="new-booking-card" id="newBookingCard_{na['id']}">
               <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-                <span class="badge-new-live">🔔 NJOFTIM #{na['id']}</span>
-                <span style="font-size:0.76rem; font-weight:800; color:#9f1239;">{esc(na['appt_date'])} • {esc(na['start_time'])}-{esc(na['end_time'])}</span>
+                <span class="badge-new-live">🔔 NJOFTIM I RI</span>
+                <span style="font-size:0.78rem; font-weight:800; color:#9f1239;">{html.escape(na['appt_date'])} • {html.escape(na['start_time'])} - {html.escape(na['end_time'])}</span>
               </div>
-              <div style="font-size:0.94rem; font-weight:800; color:#4c0519;">{esc(na['client_name'])}</div>
-              {contact_line}
-              <div style="font-size:0.81rem; font-weight:700; color:#881337; margin-top:2px;">
-                📞 <a href="tel:{esc(na['client_phone'])}" style="color:#be123c; text-decoration:underline;">{esc(na['client_phone'])}</a>
+              <div style="font-size:0.95rem; font-weight:800; color:#4c0519;">{html.escape(na['client_name'])}</div>
+              <div style="font-size:0.82rem; font-weight:700; color:#881337; margin-top:2px;">
+                📞 <a href="tel:{html.escape(na['client_phone'], quote=True)}" style="color:#be123c; text-decoration:underline;">{html.escape(na['client_phone'])}</a>
               </div>
               <div style="font-size:0.8rem; color:#261217; margin-top:4px;">
-                💅 <b>[{esc(na['category'] or '-')}] {esc(na['service_name'] or '-')}</b> ({float(na['price'] or 0):.0f}€{dur_txt})
+                💅 <b>[{html.escape(na['category'] or '-')}] {html.escape(na['service_name'] or '-')}</b> ({na['price'] or 0:.0f}€)
               </div>
               {notes_line}
               <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px; margin-top:10px;">
@@ -4201,7 +3339,7 @@ def admin_panel():
             """
 
         new_bookings_section = f"""
-        <div class="card-3d" style="border: 2px solid #e11d48; background: #fff8f9;" id="newBookingsCardSection">
+        <div class="card-3d" style="border: 2px solid #e11d48; background: #fff8f9;">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
             <h2 style="margin:0; color:#be123c;">🚨 Njoftime të Reja ({len(new_appts)})</h2>
             <form method="POST">
@@ -4238,15 +3376,12 @@ def admin_panel():
             </form>
             """
 
-        note_sub = f"<br><span style='color:#881337;font-size:0.68rem;'>📝 {esc(a['notes'])}</span>" if a["notes"] else ""
-        price_sub = f"<br><span style='color:#6e4e57;font-size:0.68rem;'>{float(a['price'] or 0):.0f}€ • {int(a['duration_min'] or 0)}m</span>" if a["service_name"] else ""
-
         rows_html += f"""
         <tr class="{row_cls}">
-          <td>{new_tag}<b>#{a["id"]} • {esc(a["appt_date"])}</b><br>{esc(a["start_time"])}-{esc(a["end_time"])}</td>
-          <td><b>{esc(a["client_name"])}</b><br><a href="tel:{esc(a["client_phone"])}" style="color:#6e4e57; text-decoration:none;">📞 {esc(a["client_phone"])}</a>{note_sub}</td>
-          <td><span class="svc-tag">{esc(a["category"] or "-")}</span><br><b>{esc(a["service_name"] or "-")}</b>{price_sub}</td>
-          <td><span class="badge {badge_cls}">{esc(a["status"])}</span></td>
+          <td>{new_tag}<b>{html.escape(a["appt_date"])}</b><br>{html.escape(a["start_time"])}-{html.escape(a["end_time"])}</td>
+          <td><b>{html.escape(a["client_name"])}</b><br><a href="tel:{html.escape(a["client_phone"], quote=True)}" style="color:#6e4e57; text-decoration:none;">{html.escape(a["client_phone"])}</a></td>
+          <td><span class="svc-tag">{html.escape(a["category"] or "-")}</span><br><b>{html.escape(a["service_name"] or "-")}</b></td>
+          <td><span class="badge {badge_cls}">{html.escape(a["status"])}</span></td>
           <td>
             {confirm_btn}
             <form method="POST" style="display:inline;">
@@ -4287,15 +3422,15 @@ def admin_panel():
               </div>
               <div>
                 <label>Çmimi (€)</label>
-                <input type="number" name="s_price" value="{float(s['price'] or 0):.2f}" min="0" step="0.5" required>
+                <input type="number" name="s_price" value="{s['price']:.2f}" min="0" step="0.5" required>
               </div>
             </div>
             <label>Emri i Shërbimit</label>
-            <input type="text" name="s_name" value="{esc(s['name'])}" required>
+            <input type="text" name="s_name" value="{html.escape(s['name'], quote=True)}" required>
             <label>Kohëzgjatja (minuta)</label>
-            <input type="number" name="s_dur" value="{int(s['duration_min'] or 60)}" min="15" step="15" required>
+            <input type="number" name="s_dur" value="{s['duration_min']}" min="15" step="15" required>
             <label>Përshkrimi</label>
-            <input type="text" name="s_desc" value="{esc(s['description'] or '')}">
+            <input type="text" name="s_desc" value="{html.escape(s['description'] or '', quote=True)}">
           </form>
           <form method="POST" style="margin-top:6px;">
             <input type="hidden" name="action" value="delete_service">
@@ -4310,14 +3445,12 @@ def admin_panel():
         cls = "alert-ok" if feedback_type == "ok" else "alert-err"
         alert_html = f"""
         <div class="alert {cls}">
-          <span>{esc(feedback_msg)}</span>
+          <span>{html.escape(feedback_msg)}</span>
           <button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Hiq ✕</button>
         </div>
         """
 
-    max_new_id = max([a["id"] for a in new_appts], default=0)
-    new_count_init = len(new_appts)
-    clients_count_init = len(registered_clients)
+    max_existing_id = max([a["id"] for a in appts], default=0)
     w_start = settings.get("work_start") or WORK_START
     w_end = settings.get("work_end") or WORK_END
     step_min = int(settings.get("slot_step_min") or SLOT_STEP_MIN)
@@ -4327,16 +3460,14 @@ def admin_panel():
       <div id="registeredClientsModal" class="modal-overlay" style="display:{'flex' if show_clients_modal else 'none'};">
         <div class="modal-card">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-            <b style="color:#72091d; font-size:0.96rem;" id="modalClientsTitle">👥 Klientët (<span id="modalClientsCount">{clients_count_init}</span>)</b>
+            <b style="color:#72091d; font-size:0.96rem;">👥 Klientët e Regjistruar ({len(registered_clients)})</b>
             <button type="button" onclick="closeRegisteredClientsModal()" style="background:none; border:none; font-size:1.1rem; font-weight:800; color:#72091d; cursor:pointer;">✕</button>
           </div>
-          <p style="margin:0 0 10px; font-size:0.74rem; color:var(--muted);">
-            Lista e plotë dhe e përditësuar e klientëve të regjistruar me veprimet <b>Fshije</b>, <b>Bllokoje / Çbllokoje</b> dhe <b>Reseto Passwordin</b>.
+          <p style="margin:0 0 10px; font-size:0.75rem; color:var(--muted);">
+            Prekni një klient për të shfaqur butonin <b>Refresko Password</b>.
           </p>
           {ext_link_banner}
-          <div id="registeredClientsListContainer">
-            {registered_clients_html}
-          </div>
+          {registered_clients_html}
         </div>
       </div>
 
@@ -4353,14 +3484,13 @@ def admin_panel():
         <div class="header-inner">
           <div>
             <h1 class="brand-title">GRANDE STUDIO</h1>
-            <p class="brand-sub">{esc(acc['email'])}</p>
+            <p class="brand-sub">{html.escape(acc['email'])}</p>
           </div>
           <div class="header-mid">
             {ig_nav_html}
           </div>
           <div class="header-actions">
-            <a href="{url_for('admin_panel')}" class="btn-3d btn-ghost-3d">↻ Rifresko</a>
-            <a href="{url_for('index', stay_client='1')}" class="btn-3d btn-ghost-3d">← Klienti</a>
+            <a href="{url_for('index')}" class="btn-3d btn-ghost-3d">← Klienti</a>
             <a href="{url_for('admin_reset_password')}" class="btn-3d btn-ghost-3d">🔑 Reset password</a>
             <a href="{url_for('admin_logout')}" class="btn-3d btn-ghost-3d">Dil</a>
           </div>
@@ -4372,33 +3502,12 @@ def admin_panel():
 
         <div class="card-3d" style="padding:11px 12px; background:#fff9fb;">
           <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
-            <div style="font-size:0.75rem; font-weight:700; color:var(--vishnje);">
-              🔔 Të reja: <span id="adminNewBadgeCount">{new_count_init}</span> • {esc(push_lib_badge)} • Push: Admin({admin_push_subs}) / Klient({client_push_subs})<br>
-              <span style="color:var(--muted); font-size:0.69rem;" id="autoSaveIndicator">Ruajtje automatike aktive • Sesion i përhershëm</span>
+            <div style="font-size:0.76rem; font-weight:700; color:var(--vishnje);">
+              🔔 Njoftimet &amp; zëri aktivë • <span id="autoSaveIndicator">Ruajtje automatike</span>
             </div>
-            <div style="display:flex; gap:6px; flex-wrap:wrap;">
-              <button type="button" onclick="testBackgroundLockScreenPush()" class="btn-sm-3d btn-seen" style="margin:0;">
-                🔔 Aktivizo / Testo Lock Screen
-              </button>
-              <button type="button" onclick="openRegisteredClientsModal()" class="btn-3d btn-vishnje-3d" style="padding:7px 11px; font-size:0.76rem;">
-                👥 Klientët (<span id="btnClientsCount">{clients_count_init}</span>)
-              </button>
-            </div>
-          </div>
-
-          <div class="stats-grid">
-            <div class="stat-box">
-              <div class="stat-num">{pending_count}</div>
-              <div class="stat-lbl">Në Pritje</div>
-            </div>
-            <div class="stat-box">
-              <div class="stat-num">{confirmed_count}</div>
-              <div class="stat-lbl">Konfirmuar</div>
-            </div>
-            <div class="stat-box">
-              <div class="stat-num">{cancelled_blocked_count}</div>
-              <div class="stat-lbl">Anuluar / Bllokuar</div>
-            </div>
+            <button type="button" onclick="openRegisteredClientsModal()" class="btn-3d btn-vishnje-3d" style="padding:7px 11px; font-size:0.76rem;">
+              👥 Klientët e Regjistruar ({len(registered_clients)})
+            </button>
           </div>
         </div>
 
@@ -4407,23 +3516,23 @@ def admin_panel():
           <div class="row-2">
             <div>
               <label for="cfg_work_start">Hapja e Orarit</label>
-              <input type="time" id="cfg_work_start" class="salon-cfg-input" value="{esc(w_start)}">
+              <input type="time" id="cfg_work_start" class="salon-cfg-input" value="{html.escape(w_start, quote=True)}">
             </div>
             <div>
               <label for="cfg_work_end">Mbyllja e Orarit</label>
-              <input type="time" id="cfg_work_end" class="salon-cfg-input" value="{esc(w_end)}">
+              <input type="time" id="cfg_work_end" class="salon-cfg-input" value="{html.escape(w_end, quote=True)}">
             </div>
           </div>
           <label for="cfg_slot_step">Hapi i Orareve (minuta)</label>
           <input type="number" id="cfg_slot_step" class="salon-cfg-input" value="{step_min}" min="15" step="15">
           <label for="cfg_hygiene_note">Shënimi i Higjienës &amp; Sterilizimit</label>
-          <input type="text" id="cfg_hygiene_note" class="salon-cfg-input" value="{esc(hygiene_note)}">
+          <input type="text" id="cfg_hygiene_note" class="salon-cfg-input" value="{html.escape(hygiene_note, quote=True)}">
         </div>
 
         {new_bookings_section}
 
         <div class="card-3d">
-          <h2>📅 Terminet &amp; Bllokimet ({len(appts)})</h2>
+          <h2>Terminet &amp; Bllokimet</h2>
           <div style="overflow-x:auto;">
             <table>
               <thead>
@@ -4517,96 +3626,10 @@ def admin_panel():
       </div>
 
       <script>
-        let lastAlertedNewId = {max_new_id};
-        let lastKnownNewCount = {new_count_init};
+        let lastKnownMaxId = {max_existing_id};
         const saveIndicator = document.getElementById('autoSaveIndicator');
-        const adminBadgeCount = document.getElementById('adminNewBadgeCount');
-        const btnClientsCount = document.getElementById('btnClientsCount');
-        const modalClientsCount = document.getElementById('modalClientsCount');
-        const clientsListContainer = document.getElementById('registeredClientsListContainer');
-
-        function escapeText(str) {{
-          return String(str || '')
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;');
-        }}
-
-        function renderClientsFromApi(clients) {{
-          if (!clientsListContainer) return;
-          if (!Array.isArray(clients) || clients.length === 0) {{
-            clientsListContainer.innerHTML = '<p style="font-size:0.8rem; color:var(--muted);">Nuk ka ende klientë të regjistruar.</p>';
-            return;
-          }}
-          clientsListContainer.innerHTML = clients.map(rc => {{
-            const isBlk = Number(rc.is_blocked || 0) === 1;
-            const badgeChannel = rc.contact_type === 'email' ? '📧 Email' : '📸 Instagram';
-            const statusBadge = isBlk
-              ? '<span class="badge-blocked" style="margin-left:5px;">I BLLOKUAR</span>'
-              : '<span class="badge b-ok" style="margin-left:5px;">AKTIV</span>';
-            const pendingBadge = Number(rc.reset_pending || 0) === 1
-              ? '<span class="badge-new-live" style="font-size:0.62rem; margin-left:5px;">Reset në pritje</span>'
-              : '';
-            const phoneTxt = rc.client_phone ? ` • 📞 ${{escapeText(rc.client_phone)}}` : '';
-            const nameTxt = (rc.full_name && rc.full_name !== rc.contact_value) ? ` — ${{escapeText(rc.full_name)}}` : '';
-            const regDate = escapeText((rc.created_at || '').slice(0, 16).replace('T', ' '));
-            const blockBtnLabel = isBlk ? '🔓 Çbllokoje' : '🚫 Bllokoje';
-            const blockBtnCls = isBlk ? 'btn-unblk' : 'btn-blk';
-            const safeContactJs = String(rc.contact_value || '').replace(/'/g, "\\\\'");
-
-            return `
-              <div class="client-list-item ${{isBlk ? 'blocked-client' : ''}}">
-                <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
-                  <b style="font-size:0.83rem; color:var(--vishnje-dark);">#${{rc.id}} • ${{escapeText(rc.contact_value)}}${{nameTxt}}</b>
-                  <span class="svc-tag">${{badgeChannel}}</span>
-                </div>
-                <div style="font-size:0.71rem; color:var(--muted); margin-top:4px; line-height:1.4;">
-                  🕒 Regjistruar: <b>${{regDate}}</b>${{phoneTxt}}<br>
-                  ${{statusBadge}} ${{pendingBadge}}
-                </div>
-                <div class="client-action-grid">
-                  <form method="POST">
-                    <input type="hidden" name="action" value="delete_client">
-                    <input type="hidden" name="client_id" value="${{rc.id}}">
-                    <button type="submit" class="btn-sm-3d btn-del" style="width:100%;" onclick="return confirm('A jeni të sigurt që doni ta fshini klientin ${{safeContactJs}}?');">
-                      🗑️ Fshije
-                    </button>
-                  </form>
-                  <form method="POST">
-                    <input type="hidden" name="action" value="toggle_block_client">
-                    <input type="hidden" name="client_id" value="${{rc.id}}">
-                    <button type="submit" class="btn-sm-3d ${{blockBtnCls}}" style="width:100%;">
-                      ${{blockBtnLabel}}
-                    </button>
-                  </form>
-                  <form method="POST">
-                    <input type="hidden" name="action" value="refresh_client_password">
-                    <input type="hidden" name="client_id" value="${{rc.id}}">
-                    <button type="submit" class="btn-sm-3d btn-rst" style="width:100%;">
-                      🔑 Reseto Passwordin
-                    </button>
-                  </form>
-                </div>
-              </div>
-            `;
-          }}).join('');
-        }}
-
-        async function refreshClientsLive() {{
-          try {{
-            const res = await fetch('/api/admin/clients');
-            if (!res.ok) return;
-            const data = await res.json();
-            const cnt = Number(data.count || 0);
-            if (btnClientsCount) btnClientsCount.textContent = String(cnt);
-            if (modalClientsCount) modalClientsCount.textContent = String(cnt);
-            renderClientsFromApi(data.clients || []);
-          }} catch (e) {{}}
-        }}
 
         function openRegisteredClientsModal() {{
-          refreshClientsLive();
           const m = document.getElementById('registeredClientsModal');
           if (m) m.style.display = 'flex';
         }}
@@ -4614,6 +3637,19 @@ def admin_panel():
         function closeRegisteredClientsModal() {{
           const m = document.getElementById('registeredClientsModal');
           if (m) m.style.display = 'none';
+        }}
+
+        function selectRegisteredClient(clientId, cardEl) {{
+          document.querySelectorAll('.client-list-item').forEach(el => {{
+            el.classList.remove('selected');
+            const f = el.querySelector('.refresh-pwd-form');
+            if (f) f.style.display = 'none';
+          }});
+          if (cardEl) {{
+            cardEl.classList.add('selected');
+            const form = cardEl.querySelector('.refresh-pwd-form');
+            if (form) form.style.display = 'block';
+          }}
         }}
 
         function dismissLiveToast() {{
@@ -4671,6 +3707,10 @@ def admin_panel():
         const svcTimers = new Map();
         document.querySelectorAll('.auto-save-form').forEach((form, idx) => {{
           const triggerSave = () => {{
+            const nameVal = (form.querySelector('input[name="s_name"]')?.value || '').trim();
+            const priceVal = parseFloat(form.querySelector('input[name="s_price"]')?.value || '');
+            const durVal = parseInt(form.querySelector('input[name="s_dur"]')?.value || '', 10);
+            if (!nameVal || isNaN(priceVal) || isNaN(durVal)) return;
             if (svcTimers.has(idx)) clearTimeout(svcTimers.get(idx));
             const t = setTimeout(async () => {{
               try {{
@@ -4680,7 +3720,7 @@ def admin_panel():
                   saveIndicator.textContent = 'Shërbimi u ruajt automatikisht';
                 }}
               }} catch (e) {{}}
-            }}, 450);
+            }}, 550);
             svcTimers.set(idx, t);
           }};
           form.querySelectorAll('input, select').forEach(el => {{
@@ -4691,51 +3731,32 @@ def admin_panel():
 
         setInterval(async () => {{
           try {{
-            await refreshClientsLive();
             const res = await fetch('/api/admin/new-bookings');
             if (!res.ok) return;
             const data = await res.json();
-            const bookings = Array.isArray(data.bookings) ? data.bookings : [];
-            if (adminBadgeCount) {{
-              adminBadgeCount.textContent = String(bookings.length);
-            }}
-
-            if (bookings.length > 0) {{
-              const newest = bookings[0];
-              const hasBrandNewBooking = newest.id > lastAlertedNewId || bookings.length > lastKnownNewCount;
-
-              if (hasBrandNewBooking) {{
-                lastAlertedNewId = Math.max(lastAlertedNewId, newest.id);
-                lastKnownNewCount = bookings.length;
+            if (data.bookings && data.bookings.length > 0) {{
+              const newest = data.bookings[0];
+              if (newest.id > lastKnownMaxId) {{
+                lastKnownMaxId = newest.id;
                 playAutoAlertSound();
                 if (navigator.vibrate) navigator.vibrate([400, 150, 400, 150, 500]);
 
                 const toast = document.getElementById('liveToastBanner');
                 const toastBody = document.getElementById('liveToastBody');
                 const toastActions = document.getElementById('liveToastActions');
-                if (toast && toastBody && toastActions) {{
-                  toastBody.innerHTML = `<b>${{escapeText(newest.client_name)}}</b> (${{escapeText(newest.client_phone)}})
-                    <br>💅 ${{escapeText(newest.service_name || 'Trajtim')}} — 📅 ${{escapeText(newest.appt_date)}} në <b>${{escapeText(newest.start_time)}}</b>`;
-                  toastActions.innerHTML = `
-                    <button type="button" onclick="handleQuickApptAction(${{newest.id}}, 'Konfirmuar')" class="btn-3d btn-confirm-3d" style="width:100%;">✅ Konfirmo</button>
-                    <button type="button" onclick="handleQuickApptAction(${{newest.id}}, 'Anuluar')" class="btn-3d btn-cancel-3d" style="width:100%;">❌ Anulo</button>
-                  `;
-                  toast.style.display = 'block';
-                }}
+                toastBody.innerHTML = `<b>${{newest.client_name}}</b> (${{newest.client_phone}})<br>💅 ${{newest.service_name}} — 📅 ${{newest.appt_date}} në <b>${{newest.start_time}}</b>`;
+                toastActions.innerHTML = `
+                  <button type="button" onclick="handleQuickApptAction(${{newest.id}}, 'Konfirmuar')" class="btn-3d btn-confirm-3d" style="width:100%;">✅ Konfirmo</button>
+                  <button type="button" onclick="handleQuickApptAction(${{newest.id}}, 'Anuluar')" class="btn-3d btn-cancel-3d" style="width:100%;">❌ Anulo</button>
+                `;
+                toast.style.display = 'block';
               }}
-            }} else {{
-              lastKnownNewCount = 0;
             }}
           }} catch (e) {{}}
-        }}, 4000);
+        }}, 5000);
       </script>
     """
-    return render_iphone_shell(
-        "Paneli i Adminit — Grande Studio",
-        inner,
-        role_tag="admin",
-        admin_persist_token=session.get("admin_persist_token", ""),
-    )
+    return render_iphone_shell("Paneli i Adminit — Grande Studio", inner, role_tag="admin")
 
 
 if __name__ == "__main__":
